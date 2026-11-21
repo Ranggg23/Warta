@@ -1,0 +1,6 @@
+{
+  "name": "WartaKini",
+  "description": "Kurator berita harian cerdas dengan rangkuman AI otomatis, struktur copywriting media sosial, notifikasi real-time, dan mode baca malam.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
