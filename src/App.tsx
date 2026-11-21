@@ -6,10 +6,20 @@ import { EditorialFeed, type StudioTab } from './components/EditorialFeed';
 import { Header, type ActiveView } from './components/Header';
 import { NotificationDrawer } from './components/NotificationDrawer';
 import { PreferencesModal } from './components/PreferencesModal';
+import { TrendingKeywordsStrip } from './components/TrendingKeywordsStrip';
 import { UrlSummarizerView } from './components/UrlSummarizerView';
 import { UtilityStrip } from './components/UtilityStrip';
 import { DEFAULT_PREFERRED_CATEGORIES } from './lib/categories';
-import type { BreakingNotification, NewsArticle, NewsCategoryId } from './types/news';
+import type {
+  AIPersonaId,
+  AIProviderId,
+  AIProviderStatus,
+  BreakingNotification,
+  GroundedSource,
+  NewsArticle,
+  NewsCategoryId,
+  TrendingKeyword,
+} from './types/news';
 
 function loadStoredCategories(): NewsCategoryId[] {
   try {
@@ -68,6 +78,9 @@ export default function App() {
   const [activeQuery, setActiveQuery] = useState('');
 
   const [articles, setArticles] = useState<NewsArticle[]>([]);
+  const [trendingKeywords, setTrendingKeywords] = useState<TrendingKeyword[]>([]);
+  const [groundedSources, setGroundedSources] = useState<GroundedSource[]>([]);
+  const [webSearchQueries, setWebSearchQueries] = useState<string[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [lastUpdatedLabel, setLastUpdatedLabel] = useState('');
@@ -85,6 +98,37 @@ export default function App() {
   const [activeToast, setActiveToast] = useState<BreakingNotification | null>(null);
   const [sseConnected, setSseConnected] = useState(false);
   const [checkingBreaking, setCheckingBreaking] = useState(false);
+
+  const [aiProviders, setAiProviders] = useState<AIProviderStatus[]>([]);
+  const [selectedProvider, setSelectedProvider] = useState<AIProviderId>(() => {
+    try {
+      const saved = localStorage.getItem('wartakini_ai_provider') as AIProviderId | null;
+      return saved || 'auto';
+    } catch {
+      return 'auto';
+    }
+  });
+  const [selectedPersona, setSelectedPersona] = useState<AIPersonaId>(() => {
+    try {
+      const saved = localStorage.getItem('wartakini_ai_persona') as AIPersonaId | null;
+      return saved || 'jurnalis';
+    } catch {
+      return 'jurnalis';
+    }
+  });
+
+  useEffect(() => {
+    fetch('/api/ai/providers')
+      .then((res) => res.json())
+      .then((data) => {
+        if (Array.isArray(data?.providers)) {
+          setAiProviders(data.providers);
+        }
+      })
+      .catch(() => {
+        // Ignore provider probe error
+      });
+  }, []);
 
   // Sync light/dark theme class on <html>
   useEffect(() => {
@@ -125,6 +169,9 @@ export default function App() {
 
         const fetchedList = Array.isArray(data.articles) ? data.articles : [];
         setArticles(fetchedList);
+        setTrendingKeywords(Array.isArray(data.trendingKeywords) ? data.trendingKeywords : []);
+        setGroundedSources(Array.isArray(data.groundedSources) ? data.groundedSources : []);
+        setWebSearchQueries(Array.isArray(data.webSearchQueries) ? data.webSearchQueries : []);
         if (data.fetchedAt) {
           setLastUpdatedLabel(
             new Date(data.fetchedAt).toLocaleTimeString('id-ID', {
@@ -257,6 +304,12 @@ export default function App() {
     setActiveQuery('');
   }
 
+  function handleSelectTrendingKeyword(keyword: string) {
+    setActiveView('all');
+    setSearchInput(keyword);
+    setActiveQuery(keyword);
+  }
+
   function handleToggleSave(article: NewsArticle) {
     setSavedArticles((prev) => {
       const exists = prev.some((a) => a.id === article.id);
@@ -276,6 +329,24 @@ export default function App() {
     try {
       localStorage.setItem('wartakini_preferred_categories', JSON.stringify(categories));
       localStorage.setItem('wartakini_realtime', String(realtime));
+    } catch {
+      // Ignore
+    }
+  }
+
+  function handleChangeProvider(provider: AIProviderId) {
+    setSelectedProvider(provider);
+    try {
+      localStorage.setItem('wartakini_ai_provider', provider);
+    } catch {
+      // Ignore
+    }
+  }
+
+  function handleChangePersona(persona: AIPersonaId) {
+    setSelectedPersona(persona);
+    try {
+      localStorage.setItem('wartakini_ai_persona', persona);
     } catch {
       // Ignore
     }
@@ -347,19 +418,34 @@ export default function App() {
       />
 
       {(activeView === 'all' || activeView === 'for_you') && (
-        <CategoryFilterBar
-          selectedCategory={selectedCategory}
-          preferredCategories={preferredCategories}
-          onSelectCategory={handleSelectCategory}
-          onRefresh={() => void fetchNews(true)}
-          isLoading={isLoading}
-          lastUpdatedLabel={lastUpdatedLabel}
-        />
+        <>
+          <CategoryFilterBar
+            selectedCategory={selectedCategory}
+            preferredCategories={preferredCategories}
+            onSelectCategory={handleSelectCategory}
+            onRefresh={() => void fetchNews(true)}
+            isLoading={isLoading}
+            lastUpdatedLabel={lastUpdatedLabel}
+          />
+          <TrendingKeywordsStrip
+            keywords={trendingKeywords}
+            activeQuery={activeQuery}
+            isLoading={isLoading}
+            onSelectKeyword={handleSelectTrendingKeyword}
+            onClearKeyword={handleClearSearch}
+          />
+        </>
       )}
 
       <main className="flex-1 max-w-[1280px] w-full mx-auto px-4 sm:px-6 lg:px-8">
         {activeView === 'summarizer' ? (
-          <UrlSummarizerView />
+          <UrlSummarizerView
+            providers={aiProviders}
+            selectedProvider={selectedProvider}
+            selectedPersona={selectedPersona}
+            onChangeProvider={handleChangeProvider}
+            onChangePersona={handleChangePersona}
+          />
         ) : activeView === 'saved' ? (
           <div className="pt-8">
             <div className="pb-4 border-b border-stone-200 dark:border-zinc-800 flex items-baseline justify-between">
@@ -412,6 +498,8 @@ export default function App() {
               errorMessage={errorMessage}
               searchQuery={activeQuery}
               savedIds={savedIds}
+              groundedSources={groundedSources}
+              webSearchQueries={webSearchQueries}
               onRetry={() => void fetchNews(true)}
               onOpenArticle={(article, tab = 'ringkasan') => {
                 setModalArticle(article);
@@ -463,6 +551,11 @@ export default function App() {
         article={modalArticle}
         initialTab={modalInitialTab}
         isSaved={modalArticle ? savedIds.has(modalArticle.id) : false}
+        providers={aiProviders}
+        selectedProvider={selectedProvider}
+        selectedPersona={selectedPersona}
+        onChangeProvider={handleChangeProvider}
+        onChangePersona={handleChangePersona}
         onToggleSave={handleToggleSave}
         onClose={() => setModalArticle(null)}
       />

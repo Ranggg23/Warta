@@ -1,25 +1,51 @@
-import { Check, Copy, Link2, Loader2, PenTool } from 'lucide-react';
+import { Check, Copy, ExternalLink, Link2, Loader2, PenTool } from 'lucide-react';
 import { useState, type FormEvent } from 'react';
-import type { AISummary, CopyTone, CopywritingSuggestion, SocialPlatform } from '../types/news';
+import { sanitizeExternalUrl } from '../lib/categories';
+import type {
+  AIPersonaId,
+  AIProviderId,
+  AIProviderStatus,
+  AISummary,
+  CopyTone,
+  CopywritingSuggestion,
+  SocialPlatform,
+} from '../types/news';
+import { PersonalAIHandoff } from './PersonalAIHandoff';
 import { ShareBar } from './ShareBar';
 
-export function UrlSummarizerView() {
+interface UrlSummarizerViewProps {
+  providers: AIProviderStatus[];
+  selectedProvider: AIProviderId;
+  selectedPersona: AIPersonaId;
+  onChangeProvider: (provider: AIProviderId) => void;
+  onChangePersona: (persona: AIPersonaId) => void;
+}
+
+export function UrlSummarizerView({
+  providers,
+  selectedProvider,
+  selectedPersona,
+  onChangeProvider,
+  onChangePersona,
+}: UrlSummarizerViewProps) {
   const [inputMode, setInputMode] = useState<'url' | 'text'>('url');
   const [urlValue, setUrlValue] = useState('');
   const [textValue, setTextValue] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [quotaHit, setQuotaHit] = useState(false);
   const [summary, setSummary] = useState<AISummary | null>(null);
 
   const [platform, setPlatform] = useState<SocialPlatform>('instagram');
   const [tone, setTone] = useState<CopyTone>('informatif');
   const [copyLoading, setCopyLoading] = useState(false);
+  const [copyQuotaHit, setCopyQuotaHit] = useState(false);
   const [copyResult, setCopyResult] = useState<CopywritingSuggestion | null>(null);
   const [copiedDraft, setCopiedDraft] = useState(false);
 
-  async function handleSubmit(e: FormEvent) {
-    e.preventDefault();
+  async function runSummarize(providerOverride: AIProviderId = selectedProvider) {
     setError(null);
+    setQuotaHit(false);
     setSummary(null);
     setCopyResult(null);
 
@@ -27,8 +53,8 @@ export function UrlSummarizerView() {
       setError('Masukkan tautan artikel berita yang valid.');
       return;
     }
-    if (inputMode === 'text' && textValue.trim().length < 30) {
-      setError('Masukkan minimal 30 karakter teks berita untuk dirangkum.');
+    if (inputMode === 'text' && textValue.trim().length < 20) {
+      setError('Masukkan minimal 20 karakter teks berita untuk dirangkum.');
       return;
     }
 
@@ -39,12 +65,22 @@ export function UrlSummarizerView() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(
           inputMode === 'url'
-            ? { url: urlValue.trim() }
-            : { text: textValue.trim(), article: { title: 'Artikel Kustom' } }
+            ? {
+                url: urlValue.trim(),
+                provider: providerOverride,
+                persona: selectedPersona,
+              }
+            : {
+                text: textValue.trim(),
+                article: { title: 'Artikel Kustom' },
+                provider: providerOverride,
+                persona: selectedPersona,
+              }
         ),
       });
       const data = await res.json();
       if (!res.ok) {
+        setQuotaHit(Boolean(data?.quotaExceeded) || res.status === 429);
         throw new Error(data?.error || 'Gagal merangkum konten.');
       }
       setSummary(data);
@@ -55,9 +91,20 @@ export function UrlSummarizerView() {
     }
   }
 
-  async function handleGenerateCopy(targetPlatform: SocialPlatform, targetTone: CopyTone) {
+  function handleSubmit(e: FormEvent) {
+    e.preventDefault();
+    void runSummarize(selectedProvider);
+  }
+
+  async function handleGenerateCopy(
+    targetPlatform: SocialPlatform,
+    targetTone: CopyTone,
+    providerOverride: AIProviderId = selectedProvider
+  ) {
     if (!summary) return;
     setCopyLoading(true);
+    setCopyQuotaHit(false);
+    setError(null);
     try {
       const res = await fetch('/api/ai/copywrite', {
         method: 'POST',
@@ -69,10 +116,13 @@ export function UrlSummarizerView() {
           url: summary.verifiedUrl || '',
           platform: targetPlatform,
           tone: targetTone,
+          provider: providerOverride,
+          persona: selectedPersona,
         }),
       });
       const data = await res.json();
       if (!res.ok) {
+        setCopyQuotaHit(Boolean(data?.quotaExceeded) || res.status === 429);
         throw new Error(data?.error || 'Gagal menyusun copywriting.');
       }
       setCopyResult(data);
@@ -94,6 +144,10 @@ export function UrlSummarizerView() {
     }
   }
 
+  const activeTitle = summary?.articleTitle || (inputMode === 'url' ? urlValue.trim() : 'Artikel Berita');
+  const activeContext =
+    summary?.tldr || (inputMode === 'text' ? textValue.trim() : urlValue.trim());
+
   return (
     <section className="py-10 max-w-3xl mx-auto space-y-8">
       <div className="space-y-2 border-b border-stone-200 dark:border-zinc-800 pb-6">
@@ -101,7 +155,7 @@ export function UrlSummarizerView() {
           Ringkas Tautan &amp; Studio Copywriting
         </h1>
         <p className="text-sm sm:text-base text-stone-600 dark:text-zinc-400 leading-relaxed">
-          Tempel tautan artikel berita dari mana saja atau salin teks artikel panjang untuk mendapatkan rangkuman instan dan struktur konten media sosial siap unggah.
+          Tempel tautan atau teks artikel untuk dirangkum dengan mesin AI pilihan Anda, atau kirim langsung ke Personal AI seperti ChatGPT, Claude, Perplexity, dan Gemini.
         </p>
       </div>
 
@@ -109,29 +163,60 @@ export function UrlSummarizerView() {
         onSubmit={handleSubmit}
         className="p-5 sm:p-6 rounded-lg border border-stone-200 dark:border-zinc-800 bg-white dark:bg-[#141418] space-y-5"
       >
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => setInputMode('url')}
-            className={`px-3.5 py-2 text-xs font-medium rounded-md transition-colors cursor-pointer ${
-              inputMode === 'url'
-                ? 'bg-stone-900 text-[#FBF9F5] dark:bg-[#E4E2DD] dark:text-[#0D0D10]'
-                : 'border border-stone-200 dark:border-zinc-800 text-stone-600 dark:text-zinc-400'
-            }`}
-          >
-            Ringkas dari URL
-          </button>
-          <button
-            type="button"
-            onClick={() => setInputMode('text')}
-            className={`px-3.5 py-2 text-xs font-medium rounded-md transition-colors cursor-pointer ${
-              inputMode === 'text'
-                ? 'bg-stone-900 text-[#FBF9F5] dark:bg-[#E4E2DD] dark:text-[#0D0D10]'
-                : 'border border-stone-200 dark:border-zinc-800 text-stone-600 dark:text-zinc-400'
-            }`}
-          >
-            Tempel Teks Artikel
-          </button>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setInputMode('url')}
+              className={`px-3.5 py-2 text-xs font-medium rounded-md transition-colors cursor-pointer ${
+                inputMode === 'url'
+                  ? 'bg-stone-900 text-[#FBF9F5] dark:bg-[#E4E2DD] dark:text-[#0D0D10]'
+                  : 'border border-stone-200 dark:border-zinc-800 text-stone-600 dark:text-zinc-400'
+              }`}
+            >
+              Ringkas dari URL
+            </button>
+            <button
+              type="button"
+              onClick={() => setInputMode('text')}
+              className={`px-3.5 py-2 text-xs font-medium rounded-md transition-colors cursor-pointer ${
+                inputMode === 'text'
+                  ? 'bg-stone-900 text-[#FBF9F5] dark:bg-[#E4E2DD] dark:text-[#0D0D10]'
+                  : 'border border-stone-200 dark:border-zinc-800 text-stone-600 dark:text-zinc-400'
+              }`}
+            >
+              Tempel Teks Artikel
+            </button>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2 text-xs">
+            <select
+              aria-label="Pilih mesin AI"
+              value={selectedProvider}
+              onChange={(e) => onChangeProvider(e.target.value as AIProviderId)}
+              className="h-9 px-2.5 text-xs rounded-md border border-stone-200 dark:border-zinc-700 bg-[#FBF9F5] dark:bg-[#1A1A20] text-stone-800 dark:text-zinc-200"
+            >
+              <option value="auto">Otomatis (Anti-Kuota)</option>
+              {providers.map((p) => (
+                <option key={p.id} value={p.id} disabled={!p.configured}>
+                  {p.label} {p.configured ? '' : '(Belum diatur)'}
+                </option>
+              ))}
+              <option value="local">Ekstraktif Lokal (Tanpa Kuota)</option>
+            </select>
+
+            <select
+              aria-label="Pilih persona AI"
+              value={selectedPersona}
+              onChange={(e) => onChangePersona(e.target.value as AIPersonaId)}
+              className="h-9 px-2.5 text-xs rounded-md border border-stone-200 dark:border-zinc-700 bg-[#FBF9F5] dark:bg-[#1A1A20] text-stone-800 dark:text-zinc-200"
+            >
+              <option value="jurnalis">Persona: Jurnalis</option>
+              <option value="kreator">Persona: Kreator</option>
+              <option value="bisnis">Persona: Analis Bisnis</option>
+              <option value="peneliti">Persona: Riset</option>
+            </select>
+          </div>
         </div>
 
         {inputMode === 'url' ? (
@@ -177,7 +262,31 @@ export function UrlSummarizerView() {
         )}
 
         {error && (
-          <p className="text-xs text-red-700 dark:text-red-400">{error}</p>
+          <div className="p-3.5 rounded-md border border-red-200 dark:border-red-900/50 bg-red-50/50 dark:bg-red-950/20 space-y-2">
+            <p className="text-xs text-red-700 dark:text-red-400">{error}</p>
+            {(quotaHit || copyQuotaHit) && (
+              <div className="flex flex-wrap gap-2">
+                {quotaHit && (
+                  <button
+                    type="button"
+                    onClick={() => void runSummarize('local')}
+                    className="px-3 py-1.5 text-xs font-medium rounded-md bg-stone-900 text-[#FBF9F5] dark:bg-[#E4E2DD] dark:text-[#0D0D10] cursor-pointer"
+                  >
+                    Ringkas Ekstraktif Lokal (Tanpa Kuota)
+                  </button>
+                )}
+                {copyQuotaHit && summary && (
+                  <button
+                    type="button"
+                    onClick={() => void handleGenerateCopy(platform, tone, 'local')}
+                    className="px-3 py-1.5 text-xs font-medium rounded-md bg-stone-900 text-[#FBF9F5] dark:bg-[#E4E2DD] dark:text-[#0D0D10] cursor-pointer"
+                  >
+                    Susun Template Lokal (Tanpa Kuota)
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
         )}
 
         <div className="flex justify-end">
@@ -192,12 +301,25 @@ export function UrlSummarizerView() {
         </div>
       </form>
 
+      {(urlValue.trim() || textValue.trim()) && (
+        <PersonalAIHandoff
+          mode={summary ? 'copywrite' : 'summarize'}
+          title={activeTitle}
+          contextText={activeContext}
+          sourceUrl={inputMode === 'url' ? urlValue.trim() : summary?.verifiedUrl}
+          persona={selectedPersona}
+          platform={platform}
+          tone={tone}
+        />
+      )}
+
       {summary && (
         <div className="space-y-6">
           <div className="p-6 rounded-lg border border-stone-200 dark:border-zinc-800 bg-white dark:bg-[#141418] space-y-5">
             <div className="space-y-1 pb-3 border-b border-stone-200 dark:border-zinc-800">
               <span className="font-mono text-xs text-stone-500 dark:text-zinc-400 tabular-nums">
-                {summary.readingTimeOriginal} → {summary.readingTimeSaved} · {summary.toneLabel}
+                {summary.readingTimeOriginal} → {summary.readingTimeSaved} ·{' '}
+                {summary.engineUsed || summary.toneLabel}
               </span>
               <h2 className="font-serif text-2xl font-semibold text-stone-900 dark:text-[#F2F0EB]">
                 {summary.articleTitle}
@@ -234,6 +356,37 @@ export function UrlSummarizerView() {
               </div>
             )}
 
+            {summary.groundedSources && summary.groundedSources.length > 0 && (
+              <div className="pt-4 border-t border-stone-200 dark:border-zinc-800 space-y-2">
+                <h3 className="text-xs font-semibold text-stone-500 dark:text-zinc-400">
+                  Sumber Google Search Terverifikasi
+                </h3>
+                <div className="divide-y divide-stone-200/70 dark:divide-zinc-800/80 border border-stone-200 dark:border-zinc-800 rounded-md">
+                  {summary.groundedSources.map((src, idx) => {
+                    const url = sanitizeExternalUrl(src.url);
+                    if (!url) return null;
+                    return (
+                      <a
+                        key={`${url}-${idx}`}
+                        href={url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="px-3.5 py-2 flex items-center justify-between gap-3 text-xs hover:bg-stone-50 dark:hover:bg-zinc-900/60 transition-colors"
+                      >
+                        <span className="text-stone-800 dark:text-zinc-200 truncate">
+                          {src.title}
+                        </span>
+                        <ExternalLink
+                          className="w-3 h-3 text-stone-400 dark:text-zinc-500 shrink-0"
+                          aria-hidden="true"
+                        />
+                      </a>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
             <div className="pt-4 border-t border-stone-200 dark:border-zinc-800 flex flex-wrap items-center justify-between gap-4">
               <div className="flex flex-wrap items-center gap-2">
                 <select
@@ -260,7 +413,7 @@ export function UrlSummarizerView() {
                 </select>
                 <button
                   type="button"
-                  onClick={() => void handleGenerateCopy(platform, tone)}
+                  onClick={() => void handleGenerateCopy(platform, tone, selectedProvider)}
                   disabled={copyLoading}
                   className="h-9 px-4 text-xs font-medium rounded-md bg-stone-900 text-[#FBF9F5] hover:bg-stone-800 dark:bg-[#E4E2DD] dark:text-[#0D0D10] inline-flex items-center gap-1.5 cursor-pointer"
                 >
@@ -282,9 +435,16 @@ export function UrlSummarizerView() {
           {copyResult && (
             <div className="p-6 rounded-lg border border-stone-200 dark:border-zinc-800 bg-white dark:bg-[#141418] space-y-5">
               <div className="flex items-center justify-between gap-4 pb-3 border-b border-stone-200 dark:border-zinc-800">
-                <h3 className="text-sm font-semibold text-stone-900 dark:text-zinc-100">
-                  {copyResult.platformLabel}
-                </h3>
+                <div>
+                  <h3 className="text-sm font-semibold text-stone-900 dark:text-zinc-100">
+                    {copyResult.platformLabel}
+                  </h3>
+                  {copyResult.engineUsed && (
+                    <span className="font-mono text-[11px] text-stone-500 dark:text-zinc-400">
+                      {copyResult.engineUsed}
+                    </span>
+                  )}
+                </div>
                 <button
                   type="button"
                   onClick={handleCopyDraft}

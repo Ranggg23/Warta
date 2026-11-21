@@ -14,6 +14,9 @@ import {
 import { useEffect, useState } from 'react';
 import { getCategoryMeta, sanitizeExternalUrl } from '../lib/categories';
 import type {
+  AIPersonaId,
+  AIProviderId,
+  AIProviderStatus,
   AISummary,
   CopyTone,
   CopywritingSuggestion,
@@ -21,12 +24,18 @@ import type {
   SocialPlatform,
 } from '../types/news';
 import type { StudioTab } from './EditorialFeed';
+import { PersonalAIHandoff } from './PersonalAIHandoff';
 import { ShareBar } from './ShareBar';
 
 interface ArticleStudioModalProps {
   article: NewsArticle | null;
   initialTab: StudioTab;
   isSaved: boolean;
+  providers: AIProviderStatus[];
+  selectedProvider: AIProviderId;
+  selectedPersona: AIPersonaId;
+  onChangeProvider: (provider: AIProviderId) => void;
+  onChangePersona: (persona: AIPersonaId) => void;
   onToggleSave: (article: NewsArticle) => void;
   onClose: () => void;
 }
@@ -45,10 +54,22 @@ const TONES: Array<{ id: CopyTone; label: string }> = [
   { id: 'storytelling', label: 'Storytelling' },
 ];
 
+const PERSONAS: Array<{ id: AIPersonaId; label: string }> = [
+  { id: 'jurnalis', label: 'Jurnalis Ringkas' },
+  { id: 'kreator', label: 'Kreator Konten' },
+  { id: 'bisnis', label: 'Analis Bisnis' },
+  { id: 'peneliti', label: 'Asisten Riset' },
+];
+
 export function ArticleStudioModal({
   article,
   initialTab,
   isSaved,
+  providers,
+  selectedProvider,
+  selectedPersona,
+  onChangeProvider,
+  onChangePersona,
   onToggleSave,
   onClose,
 }: ArticleStudioModalProps) {
@@ -56,12 +77,14 @@ export function ArticleStudioModal({
   const [summary, setSummary] = useState<AISummary | null>(null);
   const [summaryLoading, setSummaryLoading] = useState(false);
   const [summaryError, setSummaryError] = useState<string | null>(null);
+  const [summaryQuotaHit, setSummaryQuotaHit] = useState(false);
 
   const [platform, setPlatform] = useState<SocialPlatform>('instagram');
   const [tone, setTone] = useState<CopyTone>('informatif');
   const [copySuggestion, setCopySuggestion] = useState<CopywritingSuggestion | null>(null);
   const [copyLoading, setCopyLoading] = useState(false);
   const [copyError, setCopyError] = useState<string | null>(null);
+  const [copyQuotaHit, setCopyQuotaHit] = useState(false);
   const [copiedFull, setCopiedFull] = useState(false);
 
   useEffect(() => {
@@ -72,9 +95,11 @@ export function ArticleStudioModal({
     if (!article) return;
     setSummary(null);
     setSummaryError(null);
+    setSummaryQuotaHit(false);
     setCopySuggestion(null);
     setCopyError(null);
-    void generateSummary(article);
+    setCopyQuotaHit(false);
+    void generateSummary(article, selectedProvider, selectedPersona);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [article?.id]);
 
@@ -93,17 +118,27 @@ export function ArticleStudioModal({
   const meta = getCategoryMeta(article.category);
   const safeSourceUrl = sanitizeExternalUrl(article.sourceUrl);
 
-  async function generateSummary(target: NewsArticle) {
+  async function generateSummary(
+    target: NewsArticle,
+    providerOverride: AIProviderId = selectedProvider,
+    personaOverride: AIPersonaId = selectedPersona
+  ) {
     setSummaryLoading(true);
     setSummaryError(null);
+    setSummaryQuotaHit(false);
     try {
       const res = await fetch('/api/ai/summarize', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ article: target }),
+        body: JSON.stringify({
+          article: target,
+          provider: providerOverride,
+          persona: personaOverride,
+        }),
       });
       const data = await res.json();
       if (!res.ok) {
+        setSummaryQuotaHit(Boolean(data?.quotaExceeded) || res.status === 429);
         throw new Error(data?.error || 'Gagal membuat rangkuman AI.');
       }
       setSummary(data);
@@ -116,10 +151,16 @@ export function ArticleStudioModal({
     }
   }
 
-  async function generateCopywriting(targetPlatform: SocialPlatform, targetTone: CopyTone) {
+  async function generateCopywriting(
+    targetPlatform: SocialPlatform,
+    targetTone: CopyTone,
+    providerOverride: AIProviderId = selectedProvider,
+    personaOverride: AIPersonaId = selectedPersona
+  ) {
     if (!article) return;
     setCopyLoading(true);
     setCopyError(null);
+    setCopyQuotaHit(false);
     try {
       const res = await fetch('/api/ai/copywrite', {
         method: 'POST',
@@ -131,10 +172,13 @@ export function ArticleStudioModal({
           url: safeSourceUrl,
           platform: targetPlatform,
           tone: targetTone,
+          provider: providerOverride,
+          persona: personaOverride,
         }),
       });
       const data = await res.json();
       if (!res.ok) {
+        setCopyQuotaHit(Boolean(data?.quotaExceeded) || res.status === 429);
         throw new Error(data?.error || 'Gagal menyusun copywriting.');
       }
       setCopySuggestion(data);
@@ -206,38 +250,105 @@ export function ArticleStudioModal({
         </div>
 
         {/* Studio Navigation Tabs */}
-        <div className="px-5 sm:px-8 border-b border-stone-200 dark:border-zinc-800 bg-stone-100/50 dark:bg-[#17171C] flex items-center gap-6 shrink-0 overflow-x-auto">
-          {(
-            [
-              { id: 'ringkasan', label: 'Rangkuman AI & Artikel', icon: FileText },
-              { id: 'copywriting', label: 'Struktur Copywriting Sosmed', icon: PenTool },
-              { id: 'bagikan', label: 'Bagikan ke Platform', icon: Share2 },
-            ] as const
-          ).map((tab) => {
-            const Icon = tab.icon;
-            const active = activeTab === tab.id;
-            return (
-              <button
-                key={tab.id}
-                type="button"
-                onClick={() => {
-                  setActiveTab(tab.id);
-                  if (tab.id === 'copywriting' && !copySuggestion && !copyLoading) {
-                    void generateCopywriting(platform, tone);
+        <div className="px-5 sm:px-8 border-b border-stone-200 dark:border-zinc-800 bg-stone-100/50 dark:bg-[#17171C] flex items-center justify-between gap-4 shrink-0 overflow-x-auto">
+          <div className="flex items-center gap-6">
+            {(
+              [
+                { id: 'ringkasan', label: 'Rangkuman AI & Artikel', icon: FileText },
+                { id: 'copywriting', label: 'Struktur Copywriting Sosmed', icon: PenTool },
+                { id: 'bagikan', label: 'Bagikan ke Platform', icon: Share2 },
+              ] as const
+            ).map((tab) => {
+              const Icon = tab.icon;
+              const active = activeTab === tab.id;
+              return (
+                <button
+                  key={tab.id}
+                  type="button"
+                  onClick={() => {
+                    setActiveTab(tab.id);
+                    if (tab.id === 'copywriting' && !copySuggestion && !copyLoading) {
+                      void generateCopywriting(platform, tone);
+                    }
+                  }}
+                  className={`py-3.5 text-xs sm:text-sm font-medium inline-flex items-center gap-2 border-b-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                    active
+                      ? 'border-red-700 dark:border-red-400 text-stone-900 dark:text-zinc-100 font-semibold'
+                      : 'border-transparent text-stone-500 dark:text-zinc-400 hover:text-stone-800 dark:hover:text-zinc-200'
+                  }`}
+                >
+                  <Icon className="w-4 h-4" aria-hidden="true" />
+                  <span>{tab.label}</span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        {/* Personal AI Engine & Persona Bar */}
+        {activeTab !== 'bagikan' && (
+          <div className="px-5 sm:px-8 py-2.5 border-b border-stone-200 dark:border-zinc-800 bg-white/70 dark:bg-[#15151A] flex flex-wrap items-center justify-between gap-3 shrink-0 text-xs">
+            <div className="flex flex-wrap items-center gap-2">
+              <label
+                htmlFor="studio-provider-select"
+                className="text-stone-500 dark:text-zinc-400 font-medium"
+              >
+                Mesin AI:
+              </label>
+              <select
+                id="studio-provider-select"
+                value={selectedProvider}
+                onChange={(e) => {
+                  const next = e.target.value as AIProviderId;
+                  onChangeProvider(next);
+                  if (activeTab === 'ringkasan') {
+                    void generateSummary(article, next, selectedPersona);
+                  } else {
+                    void generateCopywriting(platform, tone, next, selectedPersona);
                   }
                 }}
-                className={`py-3.5 text-xs sm:text-sm font-medium inline-flex items-center gap-2 border-b-2 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                  active
-                    ? 'border-red-700 dark:border-red-400 text-stone-900 dark:text-zinc-100 font-semibold'
-                    : 'border-transparent text-stone-500 dark:text-zinc-400 hover:text-stone-800 dark:hover:text-zinc-200'
-                }`}
+                className="h-8 px-2.5 text-xs rounded-md border border-stone-200 dark:border-zinc-700 bg-[#FBF9F5] dark:bg-[#1C1C22] text-stone-800 dark:text-zinc-200"
               >
-                <Icon className="w-4 h-4" aria-hidden="true" />
-                <span>{tab.label}</span>
-              </button>
-            );
-          })}
-        </div>
+                <option value="auto">Otomatis (Anti-Kuota / Failover)</option>
+                {providers.map((p) => (
+                  <option key={p.id} value={p.id} disabled={!p.configured}>
+                    {p.label} {p.configured ? '' : '(Belum diatur)'}
+                  </option>
+                ))}
+                <option value="local">Ekstraktif / Template Lokal (Tanpa Kuota)</option>
+              </select>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              <label
+                htmlFor="studio-persona-select"
+                className="text-stone-500 dark:text-zinc-400 font-medium"
+              >
+                Persona AI:
+              </label>
+              <select
+                id="studio-persona-select"
+                value={selectedPersona}
+                onChange={(e) => {
+                  const next = e.target.value as AIPersonaId;
+                  onChangePersona(next);
+                  if (activeTab === 'ringkasan') {
+                    void generateSummary(article, selectedProvider, next);
+                  } else {
+                    void generateCopywriting(platform, tone, selectedProvider, next);
+                  }
+                }}
+                className="h-8 px-2.5 text-xs rounded-md border border-stone-200 dark:border-zinc-700 bg-[#FBF9F5] dark:bg-[#1C1C22] text-stone-800 dark:text-zinc-200"
+              >
+                {PERSONAS.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+        )}
 
         {/* Scrollable Content */}
         <div className="flex-1 overflow-y-auto px-5 sm:px-8 py-6 sm:py-8">
@@ -247,7 +358,7 @@ export function ArticleStudioModal({
             </h2>
 
             {activeTab === 'ringkasan' && (
-              <div className="space-y-8">
+              <div className="space-y-6">
                 {/* AI Summary Block */}
                 <section
                   aria-label="Rangkuman Otomatis AI"
@@ -256,19 +367,19 @@ export function ArticleStudioModal({
                   <div className="flex flex-wrap items-center justify-between gap-2 pb-3 border-b border-stone-200 dark:border-zinc-800">
                     <div>
                       <h3 className="text-sm font-semibold text-stone-900 dark:text-zinc-100">
-                        Rangkuman Otomatis AI
+                        Rangkuman Otomatis
                       </h3>
                       {summary && (
                         <p className="font-mono text-xs text-stone-500 dark:text-zinc-400 tabular-nums mt-0.5">
-                          Hemat waktu: {summary.readingTimeOriginal} → {summary.readingTimeSaved} ·{' '}
-                          {summary.toneLabel}
+                          {summary.readingTimeOriginal} → {summary.readingTimeSaved} ·{' '}
+                          {summary.engineUsed || summary.toneLabel}
                         </p>
                       )}
                     </div>
 
                     <button
                       type="button"
-                      onClick={() => void generateSummary(article)}
+                      onClick={() => void generateSummary(article, selectedProvider, selectedPersona)}
                       disabled={summaryLoading}
                       className="px-3 py-1.5 text-xs font-medium rounded-md border border-stone-200 dark:border-zinc-700 text-stone-700 dark:text-zinc-300 hover:border-stone-400 dark:hover:border-zinc-500 inline-flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
                     >
@@ -288,8 +399,21 @@ export function ArticleStudioModal({
                   )}
 
                   {summaryError && (
-                    <div className="text-sm text-red-700 dark:text-red-400 space-y-2">
-                      <p>{summaryError}</p>
+                    <div className="p-4 rounded-md border border-red-200 dark:border-red-900/50 bg-red-50/50 dark:bg-red-950/20 space-y-3">
+                      <p className="text-xs sm:text-sm text-red-700 dark:text-red-400 leading-relaxed">
+                        {summaryError}
+                      </p>
+                      {summaryQuotaHit && (
+                        <div className="flex flex-wrap items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={() => void generateSummary(article, 'local', selectedPersona)}
+                            className="px-3.5 py-1.5 text-xs font-medium rounded-md bg-stone-900 text-[#FBF9F5] hover:bg-stone-800 dark:bg-[#E4E2DD] dark:text-[#0D0D10] cursor-pointer"
+                          >
+                            Gunakan Ringkasan Ekstraktif Lokal (Tanpa Kuota)
+                          </button>
+                        </div>
+                      )}
                     </div>
                   )}
 
@@ -339,6 +463,15 @@ export function ArticleStudioModal({
                   )}
                 </section>
 
+                {/* Personal AI Integration Handoff */}
+                <PersonalAIHandoff
+                  mode="summarize"
+                  title={article.title}
+                  contextText={`${article.excerpt}\n${article.content}`}
+                  sourceUrl={safeSourceUrl}
+                  persona={selectedPersona}
+                />
+
                 {/* Full Article Body */}
                 <section aria-label="Isi Berita" className="space-y-4">
                   <div className="aspect-video w-full overflow-hidden rounded-lg bg-stone-200 dark:bg-zinc-900 border border-stone-200 dark:border-zinc-800">
@@ -350,26 +483,56 @@ export function ArticleStudioModal({
                     />
                   </div>
 
-                  <div className="space-y-4 text-base text-stone-800 dark:text-[#E4E2DD] leading-[1.75]">
+                  <div className="space-y-4 text-base text-stone-800 dark:text-[#E4E2DD] leading-[1.75] whitespace-pre-line">
                     {article.content.split('\n\n').map((para, idx) => (
                       <p key={idx}>{para}</p>
                     ))}
                   </div>
 
-                  {safeSourceUrl && (
-                    <div className="pt-4 border-t border-stone-200 dark:border-zinc-800 flex flex-wrap items-center justify-between gap-3">
-                      <span className="text-xs text-stone-500 dark:text-zinc-400">
-                        Sumber rujukan: {article.sourceName}
-                      </span>
-                      <a
-                        href={safeSourceUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="inline-flex items-center gap-1.5 text-xs font-medium text-red-700 dark:text-red-400 hover:underline"
-                      >
-                        <span>Baca di Sumber Asli</span>
-                        <ExternalLink className="w-3.5 h-3.5" aria-hidden="true" />
-                      </a>
+                  {(safeSourceUrl || (article.groundedSources && article.groundedSources.length > 0)) && (
+                    <div className="pt-5 border-t border-stone-200 dark:border-zinc-800 space-y-3">
+                      <div className="flex flex-wrap items-center justify-between gap-3">
+                        <span className="text-xs font-semibold text-stone-700 dark:text-zinc-300">
+                          Sumber Google Terverifikasi · {article.sourceName}
+                        </span>
+                        {safeSourceUrl && (
+                          <a
+                            href={safeSourceUrl}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1.5 text-xs font-medium text-red-700 dark:text-red-400 hover:underline"
+                          >
+                            <span>Baca di Sumber Asli</span>
+                            <ExternalLink className="w-3.5 h-3.5" aria-hidden="true" />
+                          </a>
+                        )}
+                      </div>
+
+                      {article.groundedSources && article.groundedSources.length > 0 && (
+                        <div className="divide-y divide-stone-200/70 dark:divide-zinc-800/80 border border-stone-200 dark:border-zinc-800 rounded-md bg-white dark:bg-[#18181E]">
+                          {article.groundedSources.map((src, idx) => {
+                            const url = sanitizeExternalUrl(src.url);
+                            if (!url) return null;
+                            return (
+                              <a
+                                key={`${url}-${idx}`}
+                                href={url}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                className="px-3.5 py-2.5 flex items-center justify-between gap-3 text-xs hover:bg-stone-50 dark:hover:bg-zinc-900/60 transition-colors"
+                              >
+                                <span className="text-stone-800 dark:text-zinc-200 truncate">
+                                  {src.title}
+                                </span>
+                                <ExternalLink
+                                  className="w-3 h-3 text-stone-400 dark:text-zinc-500 shrink-0"
+                                  aria-hidden="true"
+                                />
+                              </a>
+                            );
+                          })}
+                        </div>
+                      )}
                     </div>
                   )}
                 </section>
@@ -390,7 +553,7 @@ export function ArticleStudioModal({
                           type="button"
                           onClick={() => {
                             setPlatform(p.id);
-                            void generateCopywriting(p.id, tone);
+                            void generateCopywriting(p.id, tone, selectedProvider, selectedPersona);
                           }}
                           className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                             platform === p.id
@@ -415,7 +578,7 @@ export function ArticleStudioModal({
                           type="button"
                           onClick={() => {
                             setTone(t.id);
-                            void generateCopywriting(platform, t.id);
+                            void generateCopywriting(platform, t.id, selectedProvider, selectedPersona);
                           }}
                           className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                             tone === t.id
@@ -438,18 +601,38 @@ export function ArticleStudioModal({
                 )}
 
                 {copyError && (
-                  <div className="p-5 rounded-lg border border-red-200 dark:border-red-900/50 bg-red-50/50 dark:bg-red-950/20 text-sm text-red-700 dark:text-red-400">
-                    {copyError}
+                  <div className="p-5 rounded-lg border border-red-200 dark:border-red-900/50 bg-red-50/50 dark:bg-red-950/20 space-y-3">
+                    <p className="text-xs sm:text-sm text-red-700 dark:text-red-400 leading-relaxed">
+                      {copyError}
+                    </p>
+                    {copyQuotaHit && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          void generateCopywriting(platform, tone, 'local', selectedPersona)
+                        }
+                        className="px-3.5 py-1.5 text-xs font-medium rounded-md bg-stone-900 text-[#FBF9F5] hover:bg-stone-800 dark:bg-[#E4E2DD] dark:text-[#0D0D10] cursor-pointer"
+                      >
+                        Susun Kerangka Template Lokal (Tanpa Kuota)
+                      </button>
+                    )}
                   </div>
                 )}
 
                 {copySuggestion && !copyLoading && (
                   <div className="space-y-5">
                     <div className="p-5 sm:p-6 rounded-lg border border-stone-200 dark:border-zinc-800 bg-white dark:bg-[#18181E] space-y-5">
-                      <div className="flex items-center justify-between gap-4 pb-3 border-b border-stone-200 dark:border-zinc-800">
-                        <span className="text-xs font-semibold text-stone-700 dark:text-zinc-300">
-                          {copySuggestion.platformLabel}
-                        </span>
+                      <div className="flex flex-wrap items-center justify-between gap-4 pb-3 border-b border-stone-200 dark:border-zinc-800">
+                        <div>
+                          <span className="text-xs font-semibold text-stone-700 dark:text-zinc-300 block">
+                            {copySuggestion.platformLabel}
+                          </span>
+                          {copySuggestion.engineUsed && (
+                            <span className="font-mono text-[11px] text-stone-500 dark:text-zinc-400">
+                              {copySuggestion.engineUsed}
+                            </span>
+                          )}
+                        </div>
                         <button
                           type="button"
                           onClick={handleCopyFullDraft}
@@ -518,6 +701,16 @@ export function ArticleStudioModal({
                     </div>
                   </div>
                 )}
+
+                <PersonalAIHandoff
+                  mode="copywrite"
+                  title={article.title}
+                  contextText={summary?.tldr || `${article.excerpt}\n${article.content}`}
+                  sourceUrl={safeSourceUrl}
+                  persona={selectedPersona}
+                  platform={platform}
+                  tone={tone}
+                />
               </div>
             )}
 

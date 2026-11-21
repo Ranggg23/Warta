@@ -2,14 +2,16 @@ import {
   AlertCircle,
   Bookmark,
   BookmarkCheck,
+  ExternalLink,
   FileText,
+  Globe,
   PenTool,
   RefreshCw,
   Share2,
 } from 'lucide-react';
 import { useState } from 'react';
-import { getCategoryMeta } from '../lib/categories';
-import type { NewsArticle } from '../types/news';
+import { getCategoryMeta, sanitizeExternalUrl } from '../lib/categories';
+import type { GroundedSource, NewsArticle } from '../types/news';
 
 export type StudioTab = 'ringkasan' | 'copywriting' | 'bagikan';
 
@@ -19,6 +21,8 @@ interface EditorialFeedProps {
   errorMessage: string | null;
   searchQuery: string;
   savedIds: Set<string>;
+  groundedSources?: GroundedSource[];
+  webSearchQueries?: string[];
   onRetry: () => void;
   onOpenArticle: (article: NewsArticle, initialTab?: StudioTab) => void;
   onToggleSave: (article: NewsArticle) => void;
@@ -73,6 +77,8 @@ export function EditorialFeed({
   errorMessage,
   searchQuery,
   savedIds,
+  groundedSources = [],
+  webSearchQueries = [],
   onRetry,
   onOpenArticle,
   onToggleSave,
@@ -174,7 +180,19 @@ export function EditorialFeed({
                   {leadArticle.categoryLabel}
                 </span>
                 <span aria-hidden="true">·</span>
-                <span>{leadArticle.sourceName}</span>
+                {sanitizeExternalUrl(leadArticle.sourceUrl) ? (
+                  <a
+                    href={sanitizeExternalUrl(leadArticle.sourceUrl)}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 font-medium text-stone-700 dark:text-zinc-300 hover:text-red-700 dark:hover:text-red-400 underline-offset-2 hover:underline"
+                  >
+                    <span>{leadArticle.sourceName}</span>
+                    <ExternalLink className="w-3 h-3" aria-hidden="true" />
+                  </a>
+                ) : (
+                  <span>{leadArticle.sourceName}</span>
+                )}
                 <span aria-hidden="true">·</span>
                 <span className="font-mono tabular-nums">{leadArticle.relativeTime}</span>
                 <span aria-hidden="true">·</span>
@@ -299,7 +317,19 @@ export function EditorialFeed({
                         {article.categoryLabel}
                       </span>
                       <span aria-hidden="true">·</span>
-                      <span>{article.sourceName}</span>
+                      {sanitizeExternalUrl(article.sourceUrl) ? (
+                        <a
+                          href={sanitizeExternalUrl(article.sourceUrl)}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1 hover:text-red-700 dark:hover:text-red-400 hover:underline"
+                        >
+                          <span>{article.sourceName}</span>
+                          <ExternalLink className="w-2.5 h-2.5" aria-hidden="true" />
+                        </a>
+                      ) : (
+                        <span>{article.sourceName}</span>
+                      )}
                       <span aria-hidden="true">·</span>
                       <span className="font-mono tabular-nums">{article.relativeTime}</span>
                     </div>
@@ -401,7 +431,19 @@ export function EditorialFeed({
                           {article.categoryLabel}
                         </span>
                         <span aria-hidden="true">·</span>
-                        <span>{article.sourceName}</span>
+                        {sanitizeExternalUrl(article.sourceUrl) ? (
+                          <a
+                            href={sanitizeExternalUrl(article.sourceUrl)}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="inline-flex items-center gap-1 hover:text-red-700 dark:hover:text-red-400 hover:underline"
+                          >
+                            <span>{article.sourceName}</span>
+                            <ExternalLink className="w-2.5 h-2.5" aria-hidden="true" />
+                          </a>
+                        ) : (
+                          <span>{article.sourceName}</span>
+                        )}
                         <span aria-hidden="true">·</span>
                         <span className="font-mono tabular-nums">{article.relativeTime}</span>
                         <span aria-hidden="true">·</span>
@@ -461,6 +503,69 @@ export function EditorialFeed({
                     </button>
                   </div>
                 </article>
+              );
+            })}
+          </div>
+        </section>
+      )}
+      {/* Verified Google Search Grounding Sources */}
+      {groundedSources.length > 0 && (
+        <section
+          aria-label="Sumber Google Search Terverifikasi"
+          className="pt-8 border-t border-stone-200 dark:border-zinc-800 space-y-4"
+        >
+          <div className="flex flex-wrap items-baseline justify-between gap-2">
+            <div className="inline-flex items-center gap-2">
+              <Globe className="w-4 h-4 text-stone-500 dark:text-zinc-400" aria-hidden="true" />
+              <h2 className="font-serif text-lg font-semibold text-stone-900 dark:text-[#F2F0EB]">
+                Sumber Terverifikasi Google Search
+              </h2>
+            </div>
+            <span className="font-mono text-xs text-stone-500 dark:text-zinc-400 tabular-nums">
+              {groundedSources.length} tautan rujukan
+            </span>
+          </div>
+
+          {webSearchQueries.length > 0 && (
+            <p className="text-xs text-stone-500 dark:text-zinc-400 leading-relaxed">
+              Kueri penelusuran Google:{' '}
+              <span className="font-mono text-stone-700 dark:text-zinc-300">
+                {webSearchQueries.slice(0, 4).join(' · ')}
+              </span>
+            </p>
+          )}
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+            {groundedSources.slice(0, 9).map((src, idx) => {
+              const safeUrl = sanitizeExternalUrl(src.url);
+              if (!safeUrl) return null;
+              let hostname = '';
+              try {
+                hostname = new URL(safeUrl).hostname.replace(/^www\./, '');
+              } catch {
+                hostname = safeUrl;
+              }
+              return (
+                <a
+                  key={`${safeUrl}-${idx}`}
+                  href={safeUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="p-3.5 rounded-md border border-stone-200 dark:border-zinc-800 bg-white dark:bg-[#141418] hover:border-stone-400 dark:hover:border-zinc-600 transition-colors flex items-start justify-between gap-3 group"
+                >
+                  <div className="min-w-0 space-y-1">
+                    <p className="text-xs font-medium text-stone-900 dark:text-zinc-100 group-hover:text-red-700 dark:group-hover:text-red-400 truncate">
+                      {src.title}
+                    </p>
+                    <p className="font-mono text-[11px] text-stone-500 dark:text-zinc-400 truncate">
+                      {hostname}
+                    </p>
+                  </div>
+                  <ExternalLink
+                    className="w-3.5 h-3.5 text-stone-400 dark:text-zinc-500 shrink-0 mt-0.5"
+                    aria-hidden="true"
+                  />
+                </a>
               );
             })}
           </div>

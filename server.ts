@@ -9,7 +9,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT) || 3000;
-const MODEL_ID = 'gemini-4-hydrogen';
+const GEMINI_MODEL_ID = 'gemini-4-hydrogen';
 
 const CATEGORY_LABELS: Record<string, string> = {
   teknologi: 'Teknologi & AI',
@@ -22,9 +22,48 @@ const CATEGORY_LABELS: Record<string, string> = {
   kesehatan: 'Kesehatan',
 };
 
+const CATEGORY_RSS_QUERIES: Record<string, string> = {
+  teknologi: 'teknologi OR kecerdasan buatan OR AI OR startup digital',
+  ekonomi: 'ekonomi OR bisnis OR IHSG OR rupiah OR investasi',
+  nasional: 'kebijakan pemerintah OR nasional Indonesia OR DPR OR publik',
+  sains: 'sains OR riset OR perubahan iklim OR energi terbarukan',
+  budaya: 'budaya OR desain OR arsitektur OR gaya hidup OR kuliner',
+  global: 'berita internasional OR geopolitik OR global',
+  olahraga: 'sepak bola OR bulu tangkis OR olahraga timnas',
+  kesehatan: 'kesehatan OR medis OR rumah sakit OR gizi',
+};
+
+const PERSONA_PROMPTS: Record<string, { label: string; instruction: string }> = {
+  jurnalis: {
+    label: 'Jurnalis Ringkas',
+    instruction:
+      'Gaya Asisten Jurnalis: objektif, netral, padat fakta, menekankan unsur 5W+1H dan akurasi sumber.',
+  },
+  kreator: {
+    label: 'Kreator Konten',
+    instruction:
+      'Gaya Asisten Kreator Konten: fokus pada sudut pandang menarik, daya tarik audiens, storytelling ringan, dan potensi viralitas yang etis.',
+  },
+  bisnis: {
+    label: 'Analis Bisnis',
+    instruction:
+      'Gaya Analis Bisnis & Eksekutif: fokus pada dampak pasar, peluang industri, risiko ekonomi, dan implikasi strategis.',
+  },
+  peneliti: {
+    label: 'Asisten Riset',
+    instruction:
+      'Gaya Asisten Riset: mendalam, sistematis, menyoroti konteks latar belakang, data pendukung, dan pertanyaan lanjutan.',
+  },
+};
+
 interface GroundedSource {
   title: string;
   url: string;
+}
+
+interface TrendingKeyword {
+  keyword: string;
+  count: number;
 }
 
 interface ServerNewsArticle {
@@ -40,11 +79,15 @@ interface ServerNewsArticle {
   relativeTime: string;
   readMinutes: number;
   isBreaking?: boolean;
+  keywords?: string[];
   groundedSources?: GroundedSource[];
 }
 
 interface CacheEntry {
   articles: ServerNewsArticle[];
+  trendingKeywords: TrendingKeyword[];
+  groundedSources: GroundedSource[];
+  webSearchQueries: string[];
   fetchedAt: string;
   expiresAt: number;
 }
@@ -60,15 +103,50 @@ const sseClients = new Set<SseClient>();
 const seenBreakingIds = new Set<string>();
 const recentNotifications: Array<{ id: string; article: ServerNewsArticle; receivedAt: string }> = [];
 
+function isConfiguredSecret(val: string | undefined, placeholder?: string): boolean {
+  if (!val) return false;
+  const trimmed = val.trim();
+  return trimmed.length > 5 && trimmed !== placeholder;
+}
+
+function getConfiguredProviders() {
+  return [
+    {
+      id: 'gemini',
+      label: 'Google Gemini',
+      modelLabel: GEMINI_MODEL_ID,
+      configured: isConfiguredSecret(process.env.GEMINI_API_KEY, 'MY_GEMINI_API_KEY'),
+    },
+    {
+      id: 'groq',
+      label: 'Groq (Llama 3.3)',
+      modelLabel: 'llama-3.3-70b-versatile',
+      configured: isConfiguredSecret(process.env.GROQ_API_KEY),
+    },
+    {
+      id: 'openai',
+      label: 'OpenAI (GPT-4o Mini)',
+      modelLabel: 'gpt-4o-mini',
+      configured: isConfiguredSecret(process.env.OPENAI_API_KEY),
+    },
+    {
+      id: 'anthropic',
+      label: 'Anthropic (Claude Haiku)',
+      modelLabel: 'claude-3-5-haiku-latest',
+      configured: isConfiguredSecret(process.env.ANTHROPIC_API_KEY),
+    },
+  ];
+}
+
 function getGeminiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey.trim() === '' || apiKey === 'MY_GEMINI_API_KEY') {
+  if (!isConfiguredSecret(apiKey, 'MY_GEMINI_API_KEY')) {
     throw new Error(
       'GEMINI_API_KEY belum dikonfigurasi. Silakan atur API key di panel Settings > Secrets.'
     );
   }
   return new GoogleGenAI({
-    apiKey,
+    apiKey: apiKey!.trim(),
     httpOptions: {
       headers: {
         'User-Agent': 'aistudio-build',
@@ -144,24 +222,41 @@ function extractJsonBlock(rawText: string): unknown {
   }
 }
 
-function formatErrorResponse(err: unknown): { status: number; message: string } {
+function isQuotaError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return (
+    msg.includes('RESOURCE_EXHAUSTED') ||
+    msg.includes('429') ||
+    msg.toLowerCase().includes('quota') ||
+    msg.toLowerCase().includes('rate limit')
+  );
+}
+
+function formatErrorResponse(err: unknown): {
+  status: number;
+  message: string;
+  quotaExceeded: boolean;
+} {
   const msg = err instanceof Error ? err.message : 'Terjadi kesalahan pada server.';
-  if (msg.includes('GEMINI_API_KEY')) {
-    return { status: 400, message: msg };
+  if (msg.includes('GEMINI_API_KEY') || msg.includes('belum dikonfigurasi')) {
+    return { status: 400, message: msg, quotaExceeded: false };
   }
   if (msg.includes('PERMISSION_DENIED') || msg.includes('API_KEY_INVALID') || msg.includes('403')) {
     return {
       status: 403,
-      message: 'API key Gemini tidak valid atau ditolak. Periksa Settings > Secrets.',
+      message: 'API key AI tidak valid atau ditolak. Periksa Settings > Secrets.',
+      quotaExceeded: false,
     };
   }
-  if (msg.includes('RESOURCE_EXHAUSTED') || msg.includes('429')) {
+  if (isQuotaError(err)) {
     return {
       status: 429,
-      message: 'Batas kuota permintaan Gemini tercapai. Coba lagi sebentar lagi.',
+      message:
+        'Batas kuota permintaan AI saat ini tercapai. Anda dapat langsung melanjutkan ke Personal AI pilihan Anda atau gunakan Ringkasan Ekstraktif Lokal tanpa kuota.',
+      quotaExceeded: true,
     };
   }
-  return { status: 500, message: msg };
+  return { status: 500, message: msg, quotaExceeded: false };
 }
 
 function slugifyId(text: string): string {
@@ -172,127 +267,531 @@ function slugifyId(text: string): string {
     .slice(0, 64);
 }
 
-async function fetchLiveNewsWithGemini(options: {
-  categories: string[];
-  query: string;
-  limit?: number;
-  breakingOnly?: boolean;
-}): Promise<{ articles: ServerNewsArticle[]; groundedSources: GroundedSource[] }> {
-  const ai = getGeminiClient();
-  const todayIso = new Date().toISOString().split('T')[0];
-  const todayReadable = new Date().toLocaleDateString('id-ID', {
-    weekday: 'long',
-    day: 'numeric',
-    month: 'long',
-    year: 'numeric',
-  });
+const STOPWORDS = new Set([
+  'yang', 'dan', 'di', 'ke', 'dari', 'untuk', 'pada', 'dengan', 'ini', 'itu',
+  'akan', 'dalam', 'adalah', 'oleh', 'atau', 'juga', 'bisa', 'dapat', 'karena',
+  'saat', 'hari', 'tahun', 'baru', 'lebih', 'masih', 'sudah', 'telah', 'bahwa',
+  'sebagai', 'hingga', 'sampai', 'antara', 'agar', 'namun', 'tetapi', 'seperti',
+  'berita', 'terbaru', 'terkini', 'laporan', 'indonesia', 'global', 'dunia',
+  'the', 'and', 'for', 'with', 'that', 'this', 'from', 'into', 'over', 'after',
+  'pemerintah', 'masyarakat', 'perusahaan', 'pengguna', 'melalui', 'menjadi',
+  'secara', 'terhadap', 'kepada', 'tidak', 'belum', 'banyak', 'semua', 'mulai',
+  'ungkap', 'sebut', 'bukan', 'hanya', 'cara', 'kenali', 'simak', 'berikut',
+  'kompas', 'detik', 'tribunnews', 'cnn', 'cnbc', 'tempo', 'viva', 'antara',
+]);
 
-  const validCategories = options.categories.filter((c) => c in CATEGORY_LABELS);
-  const categoryList =
-    validCategories.length > 0 ? validCategories : ['teknologi', 'ekonomi', 'nasional', 'sains'];
-  const categoryNames = categoryList.map((c) => `${c} (${CATEGORY_LABELS[c]})`).join(', ');
-  const count = options.limit ?? 9;
+function extractTopTrendingKeywords(articles: ServerNewsArticle[]): TrendingKeyword[] {
+  if (articles.length === 0) return [];
+  const scoreMap = new Map<string, { display: string; count: number; articleHits: Set<string> }>();
 
-  const searchDirective = options.query
-    ? `Cari ${count} berita terbaru hari ini (${todayReadable}, ${todayIso}) yang paling relevan dengan kata kunci pencarian: "${options.query}". Gunakan kategori paling sesuai dari daftar: ${Object.keys(CATEGORY_LABELS).join(', ')}.`
-    : options.breakingOnly
-      ? `Cari 2 berita terkini / breaking news paling baru yang rilis hari ini (${todayReadable}, ${todayIso}) untuk kategori: ${categoryNames}.`
-      : `Cari ${count} berita aktual dan terupdate hari ini (${todayReadable}, ${todayIso}) dari media terpercaya Indonesia & internasional untuk kategori: ${categoryNames}. Pastikan beragam dan mencakup setiap kategori yang diminta.`;
+  const registerTerm = (raw: string, articleId: string, weight: number) => {
+    const cleaned = raw.replace(/[^\p{L}\p{N}\s-]/gu, ' ').replace(/\s+/g, ' ').trim();
+    if (!cleaned || cleaned.length < 3) return;
+    const lower = cleaned.toLowerCase();
+    if (STOPWORDS.has(lower)) return;
+    const words = lower.split(' ');
+    if (words.length > 3 || words.every((w) => STOPWORDS.has(w))) return;
 
-  const prompt = `Anda adalah kurator redaksi berita profesional WartaKini.
-${searchDirective}
+    const existing = scoreMap.get(lower);
+    if (existing) {
+      existing.count += weight;
+      existing.articleHits.add(articleId);
+    } else {
+      scoreMap.set(lower, {
+        display: cleaned,
+        count: weight,
+        articleHits: new Set([articleId]),
+      });
+    }
+  };
 
-WAJIB gunakan hasil pencarian Google Search terbaru untuk memastikan berita benar-benar terjadi dan terbit baru-baru ini (${todayIso}).
-Kembalikan HANYA sebuah JSON array valid (tanpa teks tambahan di luar blok JSON) dengan struktur tiap item:
-{
-  "title": "Judul berita informatif dan akurat dalam Bahasa Indonesia (maks 18 kata)",
-  "excerpt": "Ringkasan pembuka 2 kalimat yang jelas dalam Bahasa Indonesia",
-  "content": "Isi artikel berita informatif 2-3 paragraf padat fakta berdasarkan laporan terkini",
-  "category": "salah satu id persis: teknologi | ekonomi | nasional | sains | budaya | global | olahraga | kesehatan",
-  "sourceName": "Nama media sumber berita (misal: Kompas, Tempo, CNBC Indonesia, Reuters, BBC, TechCrunch)",
-  "sourceUrl": "URL artikel sumber jika tersedia dari hasil pencarian, atau string kosong jika tidak yakin",
-  "publishedAt": "ISO timestamp perkiraan terbit hari ini (${todayIso})",
-  "relativeTime": "Misal: '15 menit lalu', '1 jam lalu', '3 jam lalu', 'Hari ini'",
-  "readMinutes": 3,
-  "isBreaking": true atau false (hanya 1-2 berita paling mendesak yang true)
-}`;
+  for (const article of articles) {
+    if (Array.isArray(article.keywords)) {
+      for (const kw of article.keywords) {
+        if (typeof kw === 'string') registerTerm(kw, article.id, 3);
+      }
+    }
 
-  const response = await ai.models.generateContent({
-    model: MODEL_ID,
-    contents: prompt,
-    config: {
-      tools: [{ googleSearch: {} }],
-      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-    },
-  });
+    // Bigram phrases of capitalized words in titles (e.g. "Bank Indonesia", "Kecerdasan Buatan")
+    const rawTokens = article.title
+      .replace(/[^\p{L}\p{N}\s-]/gu, ' ')
+      .split(/\s+/)
+      .filter(Boolean);
 
-  const rawText = response.text ?? '[]';
-  const parsed = extractJsonBlock(rawText);
-  const items = Array.isArray(parsed) ? parsed : [];
+    for (let i = 0; i < rawTokens.length - 1; i++) {
+      const a = rawTokens[i];
+      const b = rawTokens[i + 1];
+      if (
+        a.length >= 3 &&
+        b.length >= 3 &&
+        /^[A-Z]/.test(a) &&
+        /^[A-Z]/.test(b) &&
+        !STOPWORDS.has(a.toLowerCase()) &&
+        !STOPWORDS.has(b.toLowerCase())
+      ) {
+        registerTerm(`${a} ${b}`, article.id, 2.5);
+      }
+    }
 
-  const rawChunks = response.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];
-  const groundedSources: GroundedSource[] = [];
-  for (const chunk of rawChunks) {
-    const uri = sanitizeHttpUrl(chunk?.web?.uri);
-    const title = typeof chunk?.web?.title === 'string' ? chunk.web.title.trim() : '';
-    if (uri && title) {
-      groundedSources.push({ title, url: uri });
+    for (const w of rawTokens) {
+      if (w.length >= 4 && !STOPWORDS.has(w.toLowerCase())) {
+        registerTerm(w, article.id, 1);
+      }
     }
   }
 
-  const articles: ServerNewsArticle[] = items
-    .filter((item): item is Record<string, unknown> => Boolean(item && typeof item === 'object'))
-    .map((item, idx) => {
-      const cat =
-        typeof item.category === 'string' && item.category in CATEGORY_LABELS
-          ? item.category
-          : categoryList[idx % categoryList.length];
-      const title =
-        typeof item.title === 'string' && item.title.trim()
-          ? item.title.trim()
-          : 'Perkembangan Berita Terkini';
-      const directUrl = sanitizeHttpUrl(item.sourceUrl);
-      const fallbackGrounded = groundedSources[idx % Math.max(groundedSources.length, 1)]?.url ?? '';
-      const resolvedUrl = directUrl || fallbackGrounded;
+  return Array.from(scoreMap.values())
+    .sort((a, b) => {
+      if (b.articleHits.size !== a.articleHits.size) {
+        return b.articleHits.size - a.articleHits.size;
+      }
+      return b.count - a.count;
+    })
+    .slice(0, 5)
+    .map((entry) => ({
+      keyword: entry.display,
+      count: entry.articleHits.size,
+    }));
+}
 
-      return {
-        id: `${cat}-${slugifyId(title)}-${idx}`,
-        title,
-        excerpt:
-          typeof item.excerpt === 'string' && item.excerpt.trim()
-            ? item.excerpt.trim()
-            : 'Laporan terkini dari jaringan berita terverifikasi.',
-        content:
-          typeof item.content === 'string' && item.content.trim()
-            ? item.content.trim()
-            : typeof item.excerpt === 'string'
-              ? item.excerpt.trim()
-              : '',
-        category: cat,
-        categoryLabel: CATEGORY_LABELS[cat] ?? 'Terkini',
-        sourceName:
-          typeof item.sourceName === 'string' && item.sourceName.trim()
-            ? item.sourceName.trim()
-            : groundedSources[idx]?.title || 'Redaksi Terkini',
-        sourceUrl: resolvedUrl,
-        publishedAt:
-          typeof item.publishedAt === 'string' && item.publishedAt.trim()
-            ? item.publishedAt.trim()
-            : new Date().toISOString(),
-        relativeTime:
-          typeof item.relativeTime === 'string' && item.relativeTime.trim()
-            ? item.relativeTime.trim()
-            : 'Hari ini',
-        readMinutes:
-          typeof item.readMinutes === 'number' && item.readMinutes > 0 && item.readMinutes <= 20
-            ? Math.round(item.readMinutes)
-            : 3,
-        isBreaking: Boolean(item.isBreaking),
-        groundedSources: groundedSources.slice(0, 4),
-      };
+function decodeHtmlEntities(input: string): string {
+  return input
+    .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, '$1')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&#(\d+);/g, (_m, dec) => String.fromCharCode(Number(dec)))
+    .replace(/&#x([0-9a-fA-F]+);/g, (_m, hex) => String.fromCharCode(parseInt(hex, 16)));
+}
+
+function formatRelativeTimeId(date: Date): string {
+  const diffMs = Date.now() - date.getTime();
+  const diffMins = Math.max(1, Math.floor(diffMs / 60000));
+  if (diffMins < 60) return `${diffMins} menit lalu`;
+  const diffHours = Math.floor(diffMins / 60);
+  if (diffHours < 24) return `${diffHours} jam lalu`;
+  const diffDays = Math.floor(diffHours / 24);
+  if (diffDays === 1) return 'Kemarin';
+  if (diffDays < 7) return `${diffDays} hari lalu`;
+  return date.toLocaleDateString('id-ID', { day: 'numeric', month: 'short' });
+}
+
+function inferCategoryFromText(text: string, fallbackCategory: string): string {
+  const lower = text.toLowerCase();
+  if (/(ai|kecerdasan buatan|teknologi|aplikasi|digital|cyber|semikonduktor|startup|software|google|apple|microsoft)/.test(lower)) {
+    return 'teknologi';
+  }
+  if (/(ihsg|rupiah|ekonomi|saham|investasi|bank|inflasi|bisnis|pajak|ekspor|umkm)/.test(lower)) {
+    return 'ekonomi';
+  }
+  if (/(iklim|energi|sains|peneliti|antariksa|bmkg|hujan|polusi|mikroplastik|lingkungan)/.test(lower)) {
+    return 'sains';
+  }
+  if (/(jantung|kesehatan|dokter|dbd|rumah sakit|medis|gizi|obat|penyakit|kemenkes)/.test(lower)) {
+    return 'kesehatan';
+  }
+  if (/(timnas|sepak bola|liga|bulu tangkis|atlet|olahraga|turnamen|juara)/.test(lower)) {
+    return 'olahraga';
+  }
+  if (/(budaya|film|musik|arsitektur|kuliner|wisata|seni|desain|festival)/.test(lower)) {
+    return 'budaya';
+  }
+  if (/(eropa|amerika|china|pbb|geopolitik|timur tengah|asean|internasional)/.test(lower)) {
+    return 'global';
+  }
+  return fallbackCategory in CATEGORY_LABELS ? fallbackCategory : 'nasional';
+}
+
+async function fetchGoogleNewsRssFeed(
+  rssUrl: string,
+  fallbackCategory: string
+): Promise<ServerNewsArticle[]> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 9000);
+  try {
+    const res = await fetch(rssUrl, {
+      signal: controller.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; WartaKini/1.0)',
+        Accept: 'application/rss+xml, application/xml, text/xml',
+      },
     });
+    if (!res.ok) {
+      throw new Error(`Google News RSS mengembalikan status ${res.status}`);
+    }
+    const xml = await res.text();
+    const itemMatches = xml.match(/<item>[\s\S]*?<\/item>/g) ?? [];
+    const results: ServerNewsArticle[] = [];
 
-  return { articles, groundedSources };
+    for (let idx = 0; idx < itemMatches.length; idx++) {
+      const block = itemMatches[idx];
+      const rawTitle = decodeHtmlEntities(
+        block.match(/<title>([\s\S]*?)<\/title>/)?.[1] ?? ''
+      ).trim();
+      const rawLink = decodeHtmlEntities(
+        block.match(/<link>([\s\S]*?)<\/link>/)?.[1] ?? ''
+      ).trim();
+      const rawPubDate = (block.match(/<pubDate>([\s\S]*?)<\/pubDate>/)?.[1] ?? '').trim();
+      const rawSource = decodeHtmlEntities(
+        block.match(/<source[^>]*>([\s\S]*?)<\/source>/)?.[1] ?? ''
+      ).trim();
+      const rawDesc = decodeHtmlEntities(
+        block.match(/<description>([\s\S]*?)<\/description>/)?.[1] ?? ''
+      );
+
+      if (!rawTitle) continue;
+
+      let sourceName = rawSource;
+      let cleanTitle = rawTitle;
+      if (sourceName && cleanTitle.endsWith(` - ${sourceName}`)) {
+        cleanTitle = cleanTitle.slice(0, -(` - ${sourceName}`).length).trim();
+      } else {
+        const dashIdx = cleanTitle.lastIndexOf(' - ');
+        if (dashIdx > 12) {
+          sourceName = sourceName || cleanTitle.slice(dashIdx + 3).trim();
+          cleanTitle = cleanTitle.slice(0, dashIdx).trim();
+        }
+      }
+      sourceName = sourceName || 'Google News';
+
+      // Extract related cluster headlines from Google News <description> HTML
+      const relatedSources: GroundedSource[] = [];
+      const relatedTitles: string[] = [];
+      const anchorRegex = /<a[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>(?:[\s\S]*?<font[^>]*>([\s\S]*?)<\/font>)?/g;
+      let m: RegExpExecArray | null;
+      while ((m = anchorRegex.exec(rawDesc)) !== null) {
+        const href = sanitizeHttpUrl(m[1]);
+        const anchorText = m[2].replace(/<[^>]+>/g, '').trim();
+        const mediaText = (m[3] ?? '').replace(/<[^>]+>/g, '').trim();
+        if (href && anchorText) {
+          relatedSources.push({
+            title: mediaText ? `${anchorText} (${mediaText})` : anchorText,
+            url: href,
+          });
+          if (anchorText.toLowerCase() !== cleanTitle.toLowerCase()) {
+            relatedTitles.push(mediaText ? `${anchorText} — ${mediaText}` : anchorText);
+          }
+        }
+      }
+
+      const verifiedLink = sanitizeHttpUrl(rawLink) || relatedSources[0]?.url || '';
+      const pubDateObj = rawPubDate ? new Date(rawPubDate) : new Date();
+      const validDate = Number.isNaN(pubDateObj.getTime()) ? new Date() : pubDateObj;
+      const inferredCategory = inferCategoryFromText(
+        `${cleanTitle} ${relatedTitles.join(' ')}`,
+        fallbackCategory
+      );
+
+      const excerpt =
+        relatedTitles.length > 0
+          ? `Dilaporkan oleh ${sourceName}. Sorotan terkait: ${relatedTitles.slice(0, 2).join('; ')}.`
+          : `Laporan terbaru dari ${sourceName} yang terindeks di Google News hari ini.`;
+
+      const contentParagraphs = [
+        `${cleanTitle} — Laporan ini diterbitkan oleh ${sourceName} (${validDate.toLocaleString('id-ID', {
+          dateStyle: 'medium',
+          timeStyle: 'short',
+        })}).`,
+      ];
+      if (relatedTitles.length > 0) {
+        contentParagraphs.push(
+          `Liputan sudut pandang terkait dari jaringan Google News:\n• ${relatedTitles.slice(0, 4).join('\n• ')}`
+        );
+      } else {
+        contentParagraphs.push(
+          'Klik tombol "Buat Rangkuman AI" di atas untuk menyusun intisari otomatis atau gunakan integrasi Personal AI untuk pendalaman topik ini.'
+        );
+      }
+
+      const ageHours = (Date.now() - validDate.getTime()) / 3600000;
+      results.push({
+        id: `${inferredCategory}-${slugifyId(cleanTitle)}-${idx}`,
+        title: cleanTitle,
+        excerpt,
+        content: contentParagraphs.join('\n\n'),
+        category: inferredCategory,
+        categoryLabel: CATEGORY_LABELS[inferredCategory] ?? 'Terkini',
+        sourceName,
+        sourceUrl: verifiedLink,
+        publishedAt: validDate.toISOString(),
+        relativeTime: formatRelativeTimeId(validDate),
+        readMinutes: Math.max(2, Math.min(6, 2 + Math.floor(relatedTitles.length / 2))),
+        isBreaking: ageHours <= 3 && idx < 2,
+        groundedSources:
+          relatedSources.length > 0
+            ? relatedSources.slice(0, 4)
+            : verifiedLink
+              ? [{ title: `${cleanTitle} (${sourceName})`, url: verifiedLink }]
+              : [],
+      });
+    }
+    return results;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function fetchLiveNewsFromGoogle(options: {
+  categories: string[];
+  query: string;
+  limit?: number;
+}): Promise<{
+  articles: ServerNewsArticle[];
+  trendingKeywords: TrendingKeyword[];
+  groundedSources: GroundedSource[];
+  webSearchQueries: string[];
+}> {
+  const validCategories = options.categories.filter((c) => c in CATEGORY_LABELS);
+  const targetLimit = options.limit ?? 12;
+  const webSearchQueries: string[] = [];
+
+  let collected: ServerNewsArticle[] = [];
+
+  if (options.query) {
+    const q = options.query.trim();
+    webSearchQueries.push(q);
+    const searchUrl = `https://news.google.com/rss/search?q=${encodeURIComponent(q)}&hl=id&gl=ID&ceid=ID:id`;
+    collected = await fetchGoogleNewsRssFeed(searchUrl, validCategories[0] ?? 'nasional');
+  } else if (validCategories.length === 1) {
+    const cat = validCategories[0];
+    const queryStr = CATEGORY_RSS_QUERIES[cat] ?? CATEGORY_LABELS[cat];
+    webSearchQueries.push(CATEGORY_LABELS[cat]);
+    const searchUrl = `https://news.google.com/rss/search?q=${encodeURIComponent(`${queryStr} when:2d`)}&hl=id&gl=ID&ceid=ID:id`;
+    collected = await fetchGoogleNewsRssFeed(searchUrl, cat);
+    collected = collected.map((a) => ({
+      ...a,
+      category: cat,
+      categoryLabel: CATEGORY_LABELS[cat],
+    }));
+  } else if (validCategories.length > 1) {
+    const selected = validCategories.slice(0, 4);
+    const settled = await Promise.allSettled(
+      selected.map(async (cat) => {
+        const queryStr = CATEGORY_RSS_QUERIES[cat] ?? CATEGORY_LABELS[cat];
+        webSearchQueries.push(CATEGORY_LABELS[cat]);
+        const url = `https://news.google.com/rss/search?q=${encodeURIComponent(`${queryStr} when:2d`)}&hl=id&gl=ID&ceid=ID:id`;
+        const items = await fetchGoogleNewsRssFeed(url, cat);
+        return items.slice(0, 4).map((a) => ({
+          ...a,
+          category: cat,
+          categoryLabel: CATEGORY_LABELS[cat],
+        }));
+      })
+    );
+    for (const result of settled) {
+      if (result.status === 'fulfilled') {
+        collected.push(...result.value);
+      }
+    }
+  } else {
+    webSearchQueries.push('Google News Indonesia Hari Ini');
+    const topUrl = 'https://news.google.com/rss?hl=id&gl=ID&ceid=ID:id';
+    collected = await fetchGoogleNewsRssFeed(topUrl, 'nasional');
+  }
+
+  // Deduplicate by normalized title and sort newest first
+  const seenTitles = new Set<string>();
+  const uniqueArticles: ServerNewsArticle[] = [];
+  for (const item of collected.sort(
+    (a, b) => new Date(b.publishedAt).getTime() - new Date(a.publishedAt).getTime()
+  )) {
+    const norm = item.title.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 48);
+    if (!norm || seenTitles.has(norm)) continue;
+    seenTitles.add(norm);
+    uniqueArticles.push(item);
+    if (uniqueArticles.length >= targetLimit) break;
+  }
+
+  const seenUrls = new Set<string>();
+  const groundedSources: GroundedSource[] = [];
+  for (const art of uniqueArticles) {
+    const url = sanitizeHttpUrl(art.sourceUrl);
+    if (url && !seenUrls.has(url)) {
+      seenUrls.add(url);
+      groundedSources.push({
+        title: `${art.title} — ${art.sourceName}`,
+        url,
+      });
+    }
+  }
+
+  const trendingKeywords = extractTopTrendingKeywords(uniqueArticles);
+
+  return {
+    articles: uniqueArticles,
+    trendingKeywords,
+    groundedSources: groundedSources.slice(0, 9),
+    webSearchQueries,
+  };
+}
+
+function buildLocalExtractiveSummary(
+  title: string,
+  bodyText: string,
+  sourceName: string,
+  verifiedUrl: string
+) {
+  const cleanText = bodyText
+    .replace(/\s+/g, ' ')
+    .replace(/Klik tombol.*$/i, '')
+    .trim();
+  const rawSentences = cleanText
+    .split(/(?<=[.!?])\s+|\s*•\s*/)
+    .map((s) => s.trim())
+    .filter((s) => s.length >= 20);
+
+  const tldr =
+    rawSentences.slice(0, 2).join(' ') ||
+    `${title} — dilaporkan oleh ${sourceName || 'Google News'}.`;
+
+  const keyPoints = rawSentences.slice(0, 4);
+  if (keyPoints.length === 0) {
+    keyPoints.push(`Topik utama: ${title}.`, `Sumber berita terindeks: ${sourceName || 'Google News'}.`);
+  }
+
+  return {
+    articleTitle: title,
+    tldr,
+    keyPoints,
+    impactAndContext: `Ringkasan ekstraktif lokal dari teks artikel (${sourceName || 'Google News'}). Untuk analisis mendalam berbasis AI, pilih salah satu Personal AI terintegrasi di bawah.`,
+    readingTimeOriginal: '3 menit',
+    readingTimeSaved: '15 detik',
+    toneLabel: 'Ekstraktif Lokal (Tanpa Kuota)',
+    verifiedUrl,
+    engineUsed: 'Ekstraktif Lokal (Tanpa Kuota API)',
+    isLocalFallback: true,
+  };
+}
+
+function buildLocalTemplateCopywriting(options: {
+  title: string;
+  summary: string;
+  sourceName: string;
+  platform: string;
+  tone: string;
+}) {
+  const platformMap: Record<string, string> = {
+    instagram: 'Instagram Carousel & Caption',
+    x_thread: 'X / Twitter Thread',
+    linkedin: 'LinkedIn Insight Post',
+    tiktok: 'TikTok / Reels Script',
+  };
+  const cleanSummary = options.summary.trim() || options.title;
+  const hook = `Sudah lihat kabar terbaru ini? ${options.title}`;
+  const steps = [
+    {
+      stepNumber: '01',
+      partLabel: 'Konteks Utama',
+      content: `${options.title} — laporan terbaru dari ${options.sourceName || 'media terpercaya'}.`,
+    },
+    {
+      stepNumber: '02',
+      partLabel: 'Inti Fakta',
+      content: cleanSummary,
+    },
+    {
+      stepNumber: '03',
+      partLabel: 'Sudut Pandang Audiens',
+      content: 'Mengapa perkembangan ini relevan untuk diperhatikan minggu ini dan apa dampaknya bagi kita?',
+    },
+  ];
+  const cta = 'Menurut kamu bagaimana dampaknya ke depan? Tulis pendapatmu di komentar dan bagikan jika bermanfaat.';
+  const hashtags = ['#BeritaTerkini', '#UpdateHarian', '#InfoHariIni', '#WartaKini'];
+  const fullDraft = `${hook}\n\n${steps.map((s) => `${s.stepNumber}. ${s.partLabel}: ${s.content}`).join('\n\n')}\n\n${cta}\n\n${hashtags.join(' ')}`;
+
+  return {
+    platform: options.platform,
+    platformLabel: platformMap[options.platform] ?? platformMap.instagram,
+    tone: options.tone,
+    hook,
+    structureSteps: steps,
+    cta,
+    hashtags,
+    postingTip:
+      'Kerangka ini disusun menggunakan template lokal tanpa kuota API. Anda bisa langsung menyempurnakannya di ChatGPT, Claude, atau Gemini Personal.',
+    fullDraft,
+    engineUsed: 'Template Lokal (Tanpa Kuota API)',
+    isLocalFallback: true,
+  };
+}
+
+async function callOpenAICompatibleJson(options: {
+  endpoint: string;
+  apiKey: string;
+  model: string;
+  systemPrompt: string;
+  userPrompt: string;
+}): Promise<Record<string, unknown>> {
+  const res = await fetch(options.endpoint, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${options.apiKey}`,
+    },
+    body: JSON.stringify({
+      model: options.model,
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: options.systemPrompt },
+        { role: 'user', content: options.userPrompt },
+      ],
+    }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    const errMsg = data?.error?.message || `Status ${res.status}`;
+    throw new Error(`${res.status}: ${errMsg}`);
+  }
+  const content = data?.choices?.[0]?.message?.content ?? '{}';
+  return extractJsonBlock(content) as Record<string, unknown>;
+}
+
+async function callAnthropicJson(options: {
+  apiKey: string;
+  model: string;
+  systemPrompt: string;
+  userPrompt: string;
+}): Promise<Record<string, unknown>> {
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': options.apiKey,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model: options.model,
+      max_tokens: 1200,
+      system: options.systemPrompt,
+      messages: [{ role: 'user', content: options.userPrompt }],
+    }),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    const errMsg = data?.error?.message || `Status ${res.status}`;
+    throw new Error(`${res.status}: ${errMsg}`);
+  }
+  const text = data?.content?.[0]?.text ?? '{}';
+  return extractJsonBlock(text) as Record<string, unknown>;
+}
+
+function resolveProviderOrder(requestedProvider: string): string[] {
+  const configured = getConfiguredProviders()
+    .filter((p) => p.configured)
+    .map((p) => p.id);
+
+  if (requestedProvider && requestedProvider !== 'auto' && requestedProvider !== 'local') {
+    if (!configured.includes(requestedProvider)) {
+      throw new Error(
+        `Provider AI "${requestedProvider}" belum dikonfigurasi di Settings > Secrets.`
+      );
+    }
+    return [requestedProvider];
+  }
+  return configured;
 }
 
 function broadcastBreakingNews(article: ServerNewsArticle) {
@@ -328,6 +827,16 @@ async function startServer() {
     res.json({ ok: true, timestamp: new Date().toISOString() });
   });
 
+  app.get('/api/ai/providers', (_req: Request, res: Response) => {
+    res.json({
+      providers: getConfiguredProviders(),
+      personas: Object.entries(PERSONA_PROMPTS).map(([id, info]) => ({
+        id,
+        label: info.label,
+      })),
+    });
+  });
+
   app.get('/api/news', async (req: Request, res: Response) => {
     try {
       const q = typeof req.query.q === 'string' ? req.query.q.trim().slice(0, 140) : '';
@@ -344,26 +853,32 @@ async function startServer() {
       if (!forceRefresh && cached && cached.expiresAt > Date.now()) {
         res.json({
           articles: cached.articles,
+          trendingKeywords: cached.trendingKeywords,
+          groundedSources: cached.groundedSources,
+          webSearchQueries: cached.webSearchQueries,
           fetchedAt: cached.fetchedAt,
           cached: true,
         });
         return;
       }
 
-      const { articles } = await fetchLiveNewsWithGemini({
-        categories,
-        query: q,
-        limit: q ? 8 : 9,
-      });
+      const { articles, trendingKeywords, groundedSources, webSearchQueries } =
+        await fetchLiveNewsFromGoogle({
+          categories,
+          query: q,
+          limit: q ? 10 : 12,
+        });
 
       const fetchedAt = new Date().toISOString();
       newsCache.set(cacheKey, {
         articles,
+        trendingKeywords,
+        groundedSources,
+        webSearchQueries,
         fetchedAt,
-        expiresAt: Date.now() + 10 * 60 * 1000,
+        expiresAt: Date.now() + 5 * 60 * 1000,
       });
 
-      // Seed breaking notification history from latest breaking story if unseen
       const breakingItem = articles.find((a) => a.isBreaking) ?? articles[0];
       if (breakingItem && !seenBreakingIds.has(breakingItem.id)) {
         seenBreakingIds.add(breakingItem.id);
@@ -377,6 +892,9 @@ async function startServer() {
 
       res.json({
         articles,
+        trendingKeywords,
+        groundedSources,
+        webSearchQueries,
         fetchedAt,
         cached: false,
       });
@@ -393,14 +911,13 @@ async function startServer() {
         (c: unknown): c is string => typeof c === 'string' && c in CATEGORY_LABELS
       );
 
-      const { articles } = await fetchLiveNewsWithGemini({
+      const { articles } = await fetchLiveNewsFromGoogle({
         categories,
         query: '',
-        limit: 2,
-        breakingOnly: true,
+        limit: 3,
       });
 
-      const fresh = articles[0];
+      const fresh = articles.find((a) => !seenBreakingIds.has(a.id)) ?? articles[0];
       if (!fresh) {
         res.json({ notified: false, message: 'Belum ada berita baru saat ini.' });
         return;
@@ -462,116 +979,251 @@ async function startServer() {
 
   app.post('/api/ai/summarize', async (req: Request, res: Response) => {
     try {
-      const ai = getGeminiClient();
+      const requestedProvider =
+        typeof req.body?.provider === 'string' ? req.body.provider : 'auto';
+      const personaId =
+        typeof req.body?.persona === 'string' && req.body.persona in PERSONA_PROMPTS
+          ? req.body.persona
+          : 'jurnalis';
+      const persona = PERSONA_PROMPTS[personaId];
+
       const rawUrl = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
       const rawText = typeof req.body?.text === 'string' ? req.body.text.trim() : '';
       const article = req.body?.article as Partial<ServerNewsArticle> | undefined;
 
-      if (rawUrl) {
-        const safeUrl = validateExternalUrlForServer(rawUrl);
-        const prompt = `Baca dan analisis artikel berita dari tautan berikut: ${safeUrl}
-Buat rangkuman terstruktur dalam Bahasa Indonesia yang jernih, akurat, dan objektif agar pembaca memahami intinya dalam 30 detik.
-Kembalikan HANYA JSON valid dengan format:
-{
-  "articleTitle": "Judul artikel",
-  "tldr": "Inti berita dalam 2 kalimat padat",
-  "keyPoints": ["Poin kunci 1", "Poin kunci 2", "Poin kunci 3"],
-  "impactAndContext": "Mengapa berita ini penting dan dampaknya bagi pembaca/industri (1-2 kalimat)",
-  "readingTimeOriginal": "4 menit",
-  "readingTimeSaved": "30 detik",
-  "toneLabel": "Netral & Analitis"
-}`;
-
-        const response = await ai.models.generateContent({
-          model: MODEL_ID,
-          contents: prompt,
-          config: {
-            tools: [{ urlContext: {} }, { googleSearch: {} }],
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          },
-        });
-
-        const parsed = extractJsonBlock(response.text ?? '{}') as Record<string, unknown>;
-        res.json({
-          articleTitle:
-            typeof parsed.articleTitle === 'string' ? parsed.articleTitle : 'Ringkasan Artikel',
-          tldr: typeof parsed.tldr === 'string' ? parsed.tldr : '',
-          keyPoints: Array.isArray(parsed.keyPoints)
-            ? parsed.keyPoints.filter((k): k is string => typeof k === 'string')
-            : [],
-          impactAndContext:
-            typeof parsed.impactAndContext === 'string' ? parsed.impactAndContext : '',
-          readingTimeOriginal:
-            typeof parsed.readingTimeOriginal === 'string' ? parsed.readingTimeOriginal : '4 menit',
-          readingTimeSaved:
-            typeof parsed.readingTimeSaved === 'string' ? parsed.readingTimeSaved : '30 detik',
-          toneLabel: typeof parsed.toneLabel === 'string' ? parsed.toneLabel : 'Informatif',
-          verifiedUrl: safeUrl,
-        });
-        return;
-      }
-
       const sourceTitle = article?.title?.trim() || 'Artikel Berita';
+      const safeArticleUrl = rawUrl
+        ? validateExternalUrlForServer(rawUrl)
+        : sanitizeHttpUrl(article?.sourceUrl);
       const sourceBody =
         rawText ||
         [article?.title, article?.excerpt, article?.content].filter(Boolean).join('\n\n');
 
-      if (!sourceBody || sourceBody.length < 20) {
+      if (!rawUrl && (!sourceBody || sourceBody.length < 15)) {
         res.status(400).json({ error: 'Masukkan teks artikel atau URL berita yang ingin dirangkum.' });
         return;
       }
 
-      const response = await ai.models.generateContent({
-        model: MODEL_ID,
-        contents: `Rangkum artikel berita berikut dalam Bahasa Indonesia yang jernih, padat fakta, dan mudah dipahami:\n\nJudul: ${sourceTitle}\nSumber: ${article?.sourceName ?? 'Umum'}\n\nTeks:\n${sourceBody.slice(0, 12000)}`,
-        config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              articleTitle: { type: Type.STRING },
-              tldr: { type: Type.STRING, description: 'Inti berita dalam 2 kalimat ringkas' },
-              keyPoints: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-                description: '3 sampai 4 poin penting berbasis fakta',
-              },
-              impactAndContext: {
-                type: Type.STRING,
-                description: 'Analisis singkat konteks dan dampaknya bagi pembaca',
-              },
-              readingTimeOriginal: { type: Type.STRING, description: 'Misal: 4 menit' },
-              readingTimeSaved: { type: Type.STRING, description: 'Misal: 25 detik' },
-              toneLabel: { type: Type.STRING, description: 'Misal: Informatif, Kritis, Optimistis' },
-            },
-            required: [
-              'articleTitle',
-              'tldr',
-              'keyPoints',
-              'impactAndContext',
-              'readingTimeOriginal',
-              'readingTimeSaved',
-              'toneLabel',
-            ],
-          },
-        },
-      });
+      if (requestedProvider === 'local') {
+        res.json(
+          buildLocalExtractiveSummary(
+            sourceTitle,
+            sourceBody,
+            article?.sourceName ?? 'Google News',
+            safeArticleUrl
+          )
+        );
+        return;
+      }
 
-      const summary = JSON.parse((response.text ?? '{}').trim());
-      res.json({
-        ...summary,
-        verifiedUrl: sanitizeHttpUrl(article?.sourceUrl),
-      });
+      const providersToTry = resolveProviderOrder(requestedProvider);
+      if (providersToTry.length === 0) {
+        res.status(400).json({
+          error:
+            'Belum ada API key AI yang dikonfigurasi di Settings > Secrets. Gunakan opsi Ekstraktif Lokal atau buka langsung di Personal AI Anda.',
+          quotaExceeded: false,
+        });
+        return;
+      }
+
+      const systemPrompt = `Anda adalah asisten berita pribadi (${persona.label}). ${persona.instruction}
+Kembalikan HANYA JSON valid dengan field:
+{
+  "articleTitle": "Judul artikel",
+  "tldr": "Inti berita dalam 2 kalimat padat",
+  "keyPoints": ["Poin kunci 1", "Poin kunci 2", "Poin kunci 3"],
+  "impactAndContext": "Dampak dan konteks berita (1-2 kalimat)",
+  "readingTimeOriginal": "4 menit",
+  "readingTimeSaved": "30 detik",
+  "toneLabel": "${persona.label}"
+}`;
+
+      let lastError: unknown = null;
+
+      for (const providerId of providersToTry) {
+        try {
+          if (providerId === 'gemini') {
+            const ai = getGeminiClient();
+            if (rawUrl) {
+              const response = await ai.models.generateContent({
+                model: GEMINI_MODEL_ID,
+                contents: `${systemPrompt}\n\nBaca dan rangkum artikel berita dari tautan: ${safeArticleUrl}`,
+                config: {
+                  tools: [{ urlContext: {} }, { googleSearch: {} }],
+                  thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+                },
+              });
+              const parsed = extractJsonBlock(response.text ?? '{}') as Record<string, unknown>;
+              const summaryChunks =
+                response.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];
+              const summarySources: GroundedSource[] = [];
+              for (const chunk of summaryChunks) {
+                const uri = sanitizeHttpUrl(chunk?.web?.uri);
+                const title = typeof chunk?.web?.title === 'string' ? chunk.web.title.trim() : '';
+                if (uri && title) summarySources.push({ title, url: uri });
+              }
+              res.json({
+                articleTitle:
+                  typeof parsed.articleTitle === 'string' ? parsed.articleTitle : sourceTitle,
+                tldr: typeof parsed.tldr === 'string' ? parsed.tldr : '',
+                keyPoints: Array.isArray(parsed.keyPoints)
+                  ? parsed.keyPoints.filter((k): k is string => typeof k === 'string')
+                  : [],
+                impactAndContext:
+                  typeof parsed.impactAndContext === 'string' ? parsed.impactAndContext : '',
+                readingTimeOriginal:
+                  typeof parsed.readingTimeOriginal === 'string'
+                    ? parsed.readingTimeOriginal
+                    : '4 menit',
+                readingTimeSaved:
+                  typeof parsed.readingTimeSaved === 'string'
+                    ? parsed.readingTimeSaved
+                    : '30 detik',
+                toneLabel:
+                  typeof parsed.toneLabel === 'string' ? parsed.toneLabel : persona.label,
+                verifiedUrl: safeArticleUrl,
+                groundedSources: summarySources.slice(0, 4),
+                engineUsed: `Google Gemini (${GEMINI_MODEL_ID})`,
+                isLocalFallback: false,
+              });
+              return;
+            }
+
+            const useSearchGrounding = !rawText && Boolean(article?.title);
+            const response = await ai.models.generateContent({
+              model: GEMINI_MODEL_ID,
+              contents: `${systemPrompt}\n\nJudul: ${sourceTitle}\nSumber: ${article?.sourceName ?? 'Google News'}\nKonteks:\n${sourceBody.slice(0, 12000)}`,
+              config: useSearchGrounding
+                ? {
+                    tools: [{ googleSearch: {} }],
+                    thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+                  }
+                : {
+                    thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+                    responseMimeType: 'application/json',
+                    responseSchema: {
+                      type: Type.OBJECT,
+                      properties: {
+                        articleTitle: { type: Type.STRING },
+                        tldr: { type: Type.STRING },
+                        keyPoints: { type: Type.ARRAY, items: { type: Type.STRING } },
+                        impactAndContext: { type: Type.STRING },
+                        readingTimeOriginal: { type: Type.STRING },
+                        readingTimeSaved: { type: Type.STRING },
+                        toneLabel: { type: Type.STRING },
+                      },
+                      required: [
+                        'articleTitle',
+                        'tldr',
+                        'keyPoints',
+                        'impactAndContext',
+                        'readingTimeOriginal',
+                        'readingTimeSaved',
+                        'toneLabel',
+                      ],
+                    },
+                  },
+            });
+
+            const parsed = useSearchGrounding
+              ? (extractJsonBlock(response.text ?? '{}') as Record<string, unknown>)
+              : JSON.parse((response.text ?? '{}').trim());
+
+            const groundingChunks =
+              response.candidates?.[0]?.groundingMetadata?.groundingChunks ?? [];
+            const extraSources: GroundedSource[] = [];
+            for (const chunk of groundingChunks) {
+              const uri = sanitizeHttpUrl(chunk?.web?.uri);
+              const title = typeof chunk?.web?.title === 'string' ? chunk.web.title.trim() : '';
+              if (uri && title) extraSources.push({ title, url: uri });
+            }
+
+            res.json({
+              ...parsed,
+              verifiedUrl: safeArticleUrl,
+              groundedSources: extraSources.length > 0 ? extraSources.slice(0, 4) : undefined,
+              engineUsed: `Google Gemini (${GEMINI_MODEL_ID})`,
+              isLocalFallback: false,
+            });
+            return;
+          }
+
+          const userPrompt = rawUrl
+            ? `Rangkum artikel berita berikut:\nJudul: ${sourceTitle}\nURL: ${safeArticleUrl}\nKonteks: ${sourceBody.slice(0, 10000)}`
+            : `Judul: ${sourceTitle}\nSumber: ${article?.sourceName ?? 'Google News'}\n\nTeks:\n${sourceBody.slice(0, 12000)}`;
+
+          if (providerId === 'groq') {
+            const parsed = await callOpenAICompatibleJson({
+              endpoint: 'https://api.groq.com/openai/v1/chat/completions',
+              apiKey: process.env.GROQ_API_KEY!.trim(),
+              model: 'llama-3.3-70b-versatile',
+              systemPrompt,
+              userPrompt,
+            });
+            res.json({
+              ...parsed,
+              verifiedUrl: safeArticleUrl,
+              engineUsed: 'Groq (Llama 3.3 70B)',
+              isLocalFallback: false,
+            });
+            return;
+          }
+
+          if (providerId === 'openai') {
+            const parsed = await callOpenAICompatibleJson({
+              endpoint: 'https://api.openai.com/v1/chat/completions',
+              apiKey: process.env.OPENAI_API_KEY!.trim(),
+              model: 'gpt-4o-mini',
+              systemPrompt,
+              userPrompt,
+            });
+            res.json({
+              ...parsed,
+              verifiedUrl: safeArticleUrl,
+              engineUsed: 'OpenAI (GPT-4o Mini)',
+              isLocalFallback: false,
+            });
+            return;
+          }
+
+          if (providerId === 'anthropic') {
+            const parsed = await callAnthropicJson({
+              apiKey: process.env.ANTHROPIC_API_KEY!.trim(),
+              model: 'claude-3-5-haiku-latest',
+              systemPrompt,
+              userPrompt,
+            });
+            res.json({
+              ...parsed,
+              verifiedUrl: safeArticleUrl,
+              engineUsed: 'Anthropic (Claude 3.5 Haiku)',
+              isLocalFallback: false,
+            });
+            return;
+          }
+        } catch (err) {
+          lastError = err;
+          continue;
+        }
+      }
+
+      throw lastError ?? new Error('Seluruh penyedia AI gagal merespons.');
     } catch (err) {
-      const { status, message } = formatErrorResponse(err);
-      res.status(status).json({ error: message });
+      const { status, message, quotaExceeded } = formatErrorResponse(err);
+      res.status(status).json({ error: message, quotaExceeded });
     }
   });
 
   app.post('/api/ai/copywrite', async (req: Request, res: Response) => {
     try {
-      const ai = getGeminiClient();
+      const requestedProvider =
+        typeof req.body?.provider === 'string' ? req.body.provider : 'auto';
+      const personaId =
+        typeof req.body?.persona === 'string' && req.body.persona in PERSONA_PROMPTS
+          ? req.body.persona
+          : 'kreator';
+      const persona = PERSONA_PROMPTS[personaId];
+
       const title = typeof req.body?.title === 'string' ? req.body.title.trim() : '';
       const summary = typeof req.body?.summary === 'string' ? req.body.summary.trim() : '';
       const sourceName = typeof req.body?.sourceName === 'string' ? req.body.sourceName.trim() : '';
@@ -580,6 +1232,29 @@ Kembalikan HANYA JSON valid dengan format:
 
       if (!title && !summary) {
         res.status(400).json({ error: 'Judul atau isi berita diperlukan untuk menyusun copywriting.' });
+        return;
+      }
+
+      if (requestedProvider === 'local') {
+        res.json(
+          buildLocalTemplateCopywriting({
+            title,
+            summary,
+            sourceName,
+            platform,
+            tone,
+          })
+        );
+        return;
+      }
+
+      const providersToTry = resolveProviderOrder(requestedProvider);
+      if (providersToTry.length === 0) {
+        res.status(400).json({
+          error:
+            'Belum ada API key AI yang dikonfigurasi. Gunakan Template Lokal atau lanjutkan langsung ke Personal AI Anda.',
+          quotaExceeded: false,
+        });
         return;
       }
 
@@ -600,88 +1275,155 @@ Kembalikan HANYA JSON valid dengan format:
       const platformLabel = platformMap[platform] ?? platformMap.instagram;
       const toneLabel = toneMap[tone] ?? toneMap.informatif;
 
-      const response = await ai.models.generateContent({
-        model: MODEL_ID,
-        contents: `Anda adalah ahli strategi konten dan copywriter media sosial Indonesia.
-Susun struktur copywriting siap pakai dalam Bahasa Indonesia berdasarkan berita berikut:
+      const systemPrompt = `Anda adalah asisten strategi konten pribadi (${persona.label}). ${persona.instruction}
+Kembalikan HANYA JSON valid dengan struktur:
+{
+  "hook": "Kalimat pembuka kuat untuk menghentikan scroll",
+  "structureSteps": [
+    { "stepNumber": "01", "partLabel": "Nama Bagian", "content": "Isi copy" }
+  ],
+  "cta": "Call-to-action untuk memancing diskusi/simpan",
+  "hashtags": ["#Tag1", "#Tag2", "#Tag3", "#Tag4"],
+  "postingTip": "1 saran eksekusi singkat",
+  "fullDraft": "Draf utuh siap salin"
+}`;
+
+      const userPrompt = `Susun struktur copywriting media sosial dalam Bahasa Indonesia:
 - Judul Berita: ${title}
 - Ringkasan / Konteks: ${summary}
-- Sumber: ${sourceName || 'Media Berita'}
+- Sumber: ${sourceName || 'Google News'}
 - Platform Target: ${platformLabel}
-- Gaya Bahasa (Tone): ${toneLabel}
+- Gaya Bahasa (Tone): ${toneLabel}`;
 
-Pastikan strukturnya taktis, tidak klise, dan langsung bisa dipakai kreator konten atau jurnalis media sosial.`,
-        config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              hook: {
-                type: Type.STRING,
-                description: 'Kalimat pembuka kuat untuk menghentikan scroll',
-              },
-              structureSteps: {
-                type: Type.ARRAY,
-                items: {
+      let lastError: unknown = null;
+
+      for (const providerId of providersToTry) {
+        try {
+          if (providerId === 'gemini') {
+            const ai = getGeminiClient();
+            const response = await ai.models.generateContent({
+              model: GEMINI_MODEL_ID,
+              contents: `${systemPrompt}\n\n${userPrompt}`,
+              config: {
+                thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+                responseMimeType: 'application/json',
+                responseSchema: {
                   type: Type.OBJECT,
                   properties: {
-                    stepNumber: { type: Type.STRING, description: 'Misal: 01, 02, Slide 1, Tweet 2' },
-                    partLabel: { type: Type.STRING, description: 'Misal: Konteks Masalah, Fakta Kunci, Sudut Pandang' },
-                    content: { type: Type.STRING, description: 'Isi copy untuk bagian tersebut' },
+                    hook: { type: Type.STRING },
+                    structureSteps: {
+                      type: Type.ARRAY,
+                      items: {
+                        type: Type.OBJECT,
+                        properties: {
+                          stepNumber: { type: Type.STRING },
+                          partLabel: { type: Type.STRING },
+                          content: { type: Type.STRING },
+                        },
+                        required: ['stepNumber', 'partLabel', 'content'],
+                      },
+                    },
+                    cta: { type: Type.STRING },
+                    hashtags: { type: Type.ARRAY, items: { type: Type.STRING } },
+                    postingTip: { type: Type.STRING },
+                    fullDraft: { type: Type.STRING },
                   },
-                  required: ['stepNumber', 'partLabel', 'content'],
+                  required: ['hook', 'structureSteps', 'cta', 'hashtags', 'postingTip', 'fullDraft'],
                 },
-                description: '3 sampai 5 blok struktur isi konten',
               },
-              cta: {
-                type: Type.STRING,
-                description: 'Call-to-action untuk memancing komentar, simpan, atau bagikan',
-              },
-              hashtags: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-                description: '4 sampai 6 hashtag relevan (tanpa spasi, diawali #)',
-              },
-              postingTip: {
-                type: Type.STRING,
-                description: '1 saran singkat eksekusi visual atau waktu unggah terbaik untuk platform ini',
-              },
-              fullDraft: {
-                type: Type.STRING,
-                description: 'Draf utuh gabungan hook, isi, CTA, dan hashtag yang siap disalin',
-              },
-            },
-            required: ['hook', 'structureSteps', 'cta', 'hashtags', 'postingTip', 'fullDraft'],
-          },
-        },
-      });
+            });
 
-      const parsed = JSON.parse((response.text ?? '{}').trim());
-      res.json({
-        platform,
-        platformLabel,
-        tone,
-        ...parsed,
-      });
+            const parsed = JSON.parse((response.text ?? '{}').trim());
+            res.json({
+              platform,
+              platformLabel,
+              tone,
+              ...parsed,
+              engineUsed: `Google Gemini (${GEMINI_MODEL_ID})`,
+              isLocalFallback: false,
+            });
+            return;
+          }
+
+          if (providerId === 'groq') {
+            const parsed = await callOpenAICompatibleJson({
+              endpoint: 'https://api.groq.com/openai/v1/chat/completions',
+              apiKey: process.env.GROQ_API_KEY!.trim(),
+              model: 'llama-3.3-70b-versatile',
+              systemPrompt,
+              userPrompt,
+            });
+            res.json({
+              platform,
+              platformLabel,
+              tone,
+              ...parsed,
+              engineUsed: 'Groq (Llama 3.3 70B)',
+              isLocalFallback: false,
+            });
+            return;
+          }
+
+          if (providerId === 'openai') {
+            const parsed = await callOpenAICompatibleJson({
+              endpoint: 'https://api.openai.com/v1/chat/completions',
+              apiKey: process.env.OPENAI_API_KEY!.trim(),
+              model: 'gpt-4o-mini',
+              systemPrompt,
+              userPrompt,
+            });
+            res.json({
+              platform,
+              platformLabel,
+              tone,
+              ...parsed,
+              engineUsed: 'OpenAI (GPT-4o Mini)',
+              isLocalFallback: false,
+            });
+            return;
+          }
+
+          if (providerId === 'anthropic') {
+            const parsed = await callAnthropicJson({
+              apiKey: process.env.ANTHROPIC_API_KEY!.trim(),
+              model: 'claude-3-5-haiku-latest',
+              systemPrompt,
+              userPrompt,
+            });
+            res.json({
+              platform,
+              platformLabel,
+              tone,
+              ...parsed,
+              engineUsed: 'Anthropic (Claude 3.5 Haiku)',
+              isLocalFallback: false,
+            });
+            return;
+          }
+        } catch (err) {
+          lastError = err;
+          continue;
+        }
+      }
+
+      throw lastError ?? new Error('Seluruh penyedia AI gagal menyusun copywriting.');
     } catch (err) {
-      const { status, message } = formatErrorResponse(err);
-      res.status(status).json({ error: message });
+      const { status, message, quotaExceeded } = formatErrorResponse(err);
+      res.status(status).json({ error: message, quotaExceeded });
     }
   });
 
-  // Background real-time breaking news check every 2.5 minutes when SSE clients are listening
+  // Real-time breaking news check every 2.5 minutes using Google News RSS (zero AI quota consumed!)
   setInterval(async () => {
     if (sseClients.size === 0) return;
     const activeCategories = Array.from(
       new Set(Array.from(sseClients).flatMap((c) => c.categories))
     );
     try {
-      const { articles } = await fetchLiveNewsWithGemini({
+      const { articles } = await fetchLiveNewsFromGoogle({
         categories: activeCategories,
         query: '',
-        limit: 2,
-        breakingOnly: true,
+        limit: 3,
       });
       const candidate = articles.find((a) => !seenBreakingIds.has(a.id));
       if (candidate) {
@@ -689,7 +1431,7 @@ Pastikan strukturnya taktis, tidak klise, dan langsung bisa dipakai kreator kont
         broadcastBreakingNews({ ...candidate, isBreaking: true });
       }
     } catch {
-      // Silent background retry on next interval
+      // Retry on next interval
     }
   }, 150000);
 

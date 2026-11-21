@@ -21,6 +21,11 @@ export interface GroundedSource {
   url: string;
 }
 
+export interface TrendingKeyword {
+  keyword: string;
+  count: number;
+}
+
 export interface NewsArticle {
   id: string;
   title: string;
@@ -34,7 +39,19 @@ export interface NewsArticle {
   relativeTime: string;
   readMinutes: number;
   isBreaking?: boolean;
+  keywords?: string[];
   groundedSources?: GroundedSource[];
+}
+
+export type AIProviderId = 'auto' | 'gemini' | 'openai' | 'anthropic' | 'groq' | 'local';
+
+export type AIPersonaId = 'jurnalis' | 'kreator' | 'bisnis' | 'peneliti';
+
+export interface AIProviderStatus {
+  id: AIProviderId;
+  label: string;
+  modelLabel: string;
+  configured: boolean;
 }
 
 export interface AISummary {
@@ -46,6 +63,9 @@ export interface AISummary {
   readingTimeSaved: string;
   toneLabel: string;
   verifiedUrl?: string;
+  groundedSources?: GroundedSource[];
+  engineUsed?: string;
+  isLocalFallback?: boolean;
 }
 
 export type SocialPlatform = 'instagram' | 'x_thread' | 'linkedin' | 'tiktok';
@@ -68,6 +88,8 @@ export interface CopywritingSuggestion {
   hashtags: string[];
   postingTip: string;
   fullDraft: string;
+  engineUsed?: string;
+  isLocalFallback?: boolean;
 }
 
 export interface BreakingNotification {
